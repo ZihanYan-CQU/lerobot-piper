@@ -1,0 +1,53 @@
+{
+  "server_address": "127.0.0.1:8080",
+  "robot": {
+    "type": "piper_follower",
+    "cameras": {
+      "top": {
+        "type": "opencv",
+        "index_or_path": "/dev/video_top",
+        "width": 640,
+        "height": 480,
+        "fps": 30,
+        "rotation": 0
+      },
+      "wrist": {
+        "type": "opencv",
+        "index_or_path": "/dev/video_wrist",
+        "width": 640,
+        "height": 480,
+        "fps": 30,
+        "rotation": 180
+      }
+    },
+    "teleop_gripper_alpha": 0.25,
+    "teleop_joint_alpha": 0.25
+  },
+  "policy_type": "pi05",
+  "pretrained_name_or_path": "/home/yzh/具身智能/微调模型/Lerobot/pi0.5_shapeMatching_b32_s20000/checkpoints/020000/pretrained_model",
+  "policy_device": "cuda",
+  "actions_per_chunk": 50,
+  "chunk_size_threshold": 1.0,
+  "fps": 30,
+  "interpolation_multiplier": 2,
+  "adaptive_rtt_trigger": true,
+  "rtt_trigger_margin_steps": 5,
+  "reset_to_initial_position": true,
+  "reset_duration_s": 3.0,
+  "reset_fps": 50,
+  "rtc_mode": "guided",
+  "resize_images_on_client": true,
+  "image_transport_mode": "openpi_uint8",
+  "continuous_observation": true,
+  "observation_max_age_s": 0.1,
+  "startup_calibration_runs": 3,
+  "startup_calibration_timeout_s": 1800,
+  "latency_history_ttl_s": 300,
+  "observation_capture_fps": 30,
+  "debug_rtc_diagnostics": false,
+  "log_rtc_timing": false,
+  "debug_visualize_queue_size": false,
+  "suppress_can_debug_logs": true,
+  "disable_proxy": true,
+  "task": "Place the block on the shape-matching board."
+}

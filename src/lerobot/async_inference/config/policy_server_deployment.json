@@ -1,0 +1,24 @@
+{
+  "cuda_visible_devices": "6",
+  "host": "127.0.0.1",
+  "port": 8080,
+  "fps": 30,
+  "inference_latency": 0,
+  "rtc": {
+    "mode": "guided",
+    "execution_horizon": 20,
+    "max_guidance_weight": 10,
+    "prefix_attention_schedule": "LINEAR",
+    "debug": false
+  },
+  "reuse_last_policy": true,
+  "pi05_inference": {
+    "compile_mode": "max-autotune",
+    "profile": "lerobot",
+    "warmup_timeout_s": 1800,
+    "compile_model": true
+  },
+  "debug_rtc_diagnostics": false,
+  "debug_cuda_sync": false,
+  "fault_log_path": "/home/yzh/具身智能/DEBUG日志/deployment_guided_crash.log"
+}

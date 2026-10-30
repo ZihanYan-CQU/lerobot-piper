@@ -1,0 +1,470 @@
+"""Verified SSH-visible PIDs and safely quoted replay commands (never executed)."""
+
+from __future__ import annotations
+
+import json
+import os
+import queue
+import shlex
+import subprocess
+import threading
+import time
+from dataclasses import dataclass, replace
+from pathlib import Path
+
+if __package__:
+    from . import wn_a100_training as training
+else:
+    import wn_a100_training as training
+
+ENVIRONMENT_KEYS = (
+    "CUDA_VISIBLE_DEVICES",
+    "NVIDIA_VISIBLE_DEVICES",
+    "CUDA_DEVICE_ORDER",
+    "PATH",
+    "PYTHONPATH",
+    "LD_LIBRARY_PATH",
+    "CONDA_PREFIX",
+    "VIRTUAL_ENV",
+    "CUDA_HOME",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "PYTHONHASHSEED",
+    "CUBLAS_WORKSPACE_CONFIG",
+    "HF_HOME",
+    "HF_ENDPOINT",
+    "HF_HUB_CACHE",
+    "HUGGINGFACE_HUB_CACHE",
+    "TRANSFORMERS_CACHE",
+    "TORCH_HOME",
+    "HF_HUB_OFFLINE",
+    "WANDB_MODE",
+    "WANDB_PROJECT",
+    "WANDB_ENTITY",
+    "SSL_CERT_FILE",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+)
+
+REMOTE_INSPECTOR = r"""
+import json, os, pwd, shutil, stat, sys
+
+def read_bytes(path, limit):
+    with open(path, 'rb') as stream:
+        data = stream.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError('进程元数据超过读取上限')
+    return data
+
+def stat_info(root):
+    text = read_bytes(root + '/stat', 8192).decode('utf-8')
+    fields = text.rsplit(') ', 1)[1].split()
+    return int(fields[1]), int(fields[19])
+
+def stdio(root, number):
+    link = root + '/fd/' + str(number)
+    try:
+        path = os.readlink(link)
+        mode = os.stat(link).st_mode
+        if path.endswith(' (deleted)'):
+            return dict(kind='unavailable', path=path, append=False)
+        with open(root + '/fdinfo/' + str(number)) as stream:
+            info = dict(line.strip().split(':', 1) for line in stream if ':' in line)
+        append = bool(int(info['flags'].strip(), 8) & os.O_APPEND)
+        if stat.S_ISREG(mode) and os.path.isabs(path):
+            kind = 'file'
+        elif path == '/dev/null':
+            kind = 'null'
+        elif path.startswith('/dev/pts/') or path in ('/dev/tty', '/dev/console'):
+            kind = 'tty'
+        else:
+            kind = 'unavailable'
+        return dict(kind=kind, path=path, append=append)
+    except (OSError, KeyError, ValueError):
+        return dict(kind='unavailable', path='', append=False)
+
+def inspect(requests, allowed, proc_root='/proc'):
+    if pwd.getpwuid(os.getuid()).pw_name != 'yzh':
+        raise ValueError('只允许读取 yzh 自己的 GPU 进程')
+    found = {index: [] for index in range(len(requests))}
+    for name in os.listdir(proc_root):
+        if not name.isdigit():
+            continue
+        root = proc_root + '/' + name
+        try:
+            if os.stat(root).st_uid != os.getuid():
+                continue
+            parent, start = stat_info(root)
+            raw = read_bytes(root + '/cmdline', 65536)
+            argv = [part.decode('utf-8') for part in raw.rstrip(b'\0').split(b'\0')]
+            if not argv or not argv[0]:
+                continue
+            matching = [index for index, req in enumerate(requests)
+                        if req['command'] and ' '.join(argv).strip() == req['command'].strip()]
+            if not matching:
+                continue
+            selected = {}
+            for entry in read_bytes(root + '/environ', 262144).split(b'\0'):
+                key, sep, value = entry.partition(b'=')
+                if sep and key.decode('ascii', 'ignore') in allowed:
+                    selected[key.decode('ascii')] = value.decode('utf-8')
+            if sum(len(key) + len(value) for key, value in selected.items()) > 32768:
+                continue
+            mask = selected.get('CUDA_VISIBLE_DEVICES', '')
+            container = selected.get('NVIDIA_VISIBLE_DEVICES', 'all')
+            mask_parts = [part.strip() for part in mask.split(',')]
+            gpu_indexes = [int(part) for part in mask_parts] if mask and container == 'all' and all(part.isdigit() and 0 <= int(part) < 8 for part in mask_parts) else []
+            valid = [index for index in matching if int(name) == requests[index]['web_pid'] or requests[index]['gpu'] in gpu_indexes]
+            if not valid:
+                continue
+            cwd = os.readlink(root + '/cwd')
+            if not os.path.isabs(cwd) or not os.path.isdir(cwd):
+                continue
+            with open(root + '/status') as stream:
+                status = dict(line.strip().split(':', 1) for line in stream if ':' in line)
+            output = dict(ssh_pid=int(name), parent=parent, start=start, argv=argv,
+                          environment=selected, cwd=cwd, stdin=stdio(root, 0),
+                          stdout=stdio(root, 1), stderr=stdio(root, 2),
+                          ignore_hup=bool(int(status.get('SigIgn', '0').strip(), 16) & 1),
+                          nohup=shutil.which('nohup', path=selected.get('PATH')) or '',
+                          namespace=os.readlink(proc_root + '/self/ns/pid'))
+            if stat_info(root) != (parent, start) or read_bytes(root + '/cmdline', 65536) != raw:
+                continue  # Exited, exec'd or PID was recycled during the read.
+            for index in valid:
+                found[index].append(output)
+        except (OSError, ValueError, KeyError, UnicodeError, IndexError):
+            continue
+    results = []
+    for index, request in enumerate(requests):
+        candidates = found[index]
+        direct = [row for row in candidates if row['ssh_pid'] == request['web_pid']]
+        candidate_pids = {row['ssh_pid'] for row in candidates}
+        roots = [row for row in candidates if row['parent'] not in candidate_pids]
+        selected = direct if len(direct) == 1 else roots
+        result = dict(web_pid=request['web_pid'], gpu=request['gpu'])
+        if len(selected) == 1:
+            result.update(selected[0])
+            result['matched_by'] = 'SSH PID + 完整 argv' if direct else '完整 argv + CUDA 掩码 + 唯一主进程'
+        else:
+            result['error'] = 'SSH 中未找到对应活动主进程' if not selected else '多个主进程匹配，无法可靠核实 SSH PID'
+        results.append(result)
+    return results
+
+if __name__ == '__main__':
+    print(json.dumps(inspect(json.loads(sys.argv[1]), set(json.loads(sys.argv[2]))), ensure_ascii=False))
+""".strip()
+
+
+@dataclass(frozen=True)
+class LaunchRequest:
+    web_pid: int
+    gpu: int
+    command: str
+
+
+@dataclass(frozen=True)
+class StreamTarget:
+    kind: str = "unavailable"
+    path: str = ""
+    append: bool = False
+
+
+@dataclass(frozen=True)
+class LaunchSample:
+    request: LaunchRequest
+    ssh_pid: int | None = None
+    argv: tuple[str, ...] = ()
+    environment: tuple[tuple[str, str], ...] = ()
+    cwd: str = ""
+    stdin: StreamTarget = StreamTarget()
+    stdout: StreamTarget = StreamTarget()
+    stderr: StreamTarget = StreamTarget()
+    ignore_hup: bool = False
+    nohup: str = ""
+    namespace: str = ""
+    start: int = 0
+    matched_by: str = ""
+    checked_at: float = 0
+    error: str = ""
+
+    def is_fresh(self, *, now: float | None = None) -> bool:
+        return bool(
+            self.ssh_pid
+            and not self.error
+            and (time.monotonic() if now is None else now) - self.checked_at < 30
+        )
+
+
+@dataclass(frozen=True)
+class LaunchEvent:
+    requests: tuple[LaunchRequest, ...]
+    samples: tuple[LaunchSample, ...] = ()
+    error: str = ""
+
+
+class LaunchError(RuntimeError):
+    pass
+
+
+def _safe_text(value: object, *, limit: int = 65536) -> str:
+    if not isinstance(value, str) or len(value) > limit or "\0" in value:
+        raise LaunchError("SSH 元数据字段无效")
+    return value
+
+
+def _stream(value: object) -> StreamTarget:
+    if (
+        not isinstance(value, dict)
+        or value.get("kind") not in ("file", "null", "tty", "unavailable")
+        or type(value.get("append")) is not bool
+    ):
+        raise LaunchError("SSH 输出描述无效")
+    path = _safe_text(value.get("path"), limit=4096)
+    if value["kind"] != "unavailable" and (
+        not path.startswith("/") or path.endswith(" (deleted)")
+    ):
+        raise LaunchError("无法还原输出路径")
+    return StreamTarget(value["kind"], path, value["append"])
+
+
+def parse_samples(
+    payload: object, requests: tuple[LaunchRequest, ...]
+) -> tuple[LaunchSample, ...]:
+    if not isinstance(payload, list) or len(payload) != len(requests):
+        raise LaunchError("SSH 进程响应不完整")
+    samples = []
+    for row, request in zip(payload, requests, strict=True):
+        if (
+            not isinstance(row, dict)
+            or row.get("web_pid") != request.web_pid
+            or row.get("gpu") != request.gpu
+        ):
+            raise LaunchError("SSH 响应与请求的 GPU / 来源编号不匹配")
+        if row.get("error"):
+            samples.append(LaunchSample(request, error=_safe_text(row["error"])))
+            continue
+        pid, start = row.get("ssh_pid"), row.get("start")
+        if (
+            type(pid) is not int
+            or not 0 < pid < 2**31
+            or type(start) is not int
+            or start <= 0
+        ):
+            raise LaunchError("SSH PID 身份无效")
+        argv = row.get("argv")
+        if not isinstance(argv, list) or not argv or len(argv) > 4096:
+            raise LaunchError("SSH argv 无效")
+        argv = tuple(_safe_text(arg) for arg in argv)
+        if not argv[0] or " ".join(argv).strip() != request.command.strip():
+            raise LaunchError("SSH 指令不匹配，可能是旧网页 PID 或已重启的任务")
+        environment = row.get("environment")
+        if not isinstance(environment, dict) or any(
+            key not in ENVIRONMENT_KEYS for key in environment
+        ):
+            raise LaunchError("拒绝不在白名单内的环境变量")
+        selected = tuple(
+            (key, _safe_text(environment[key], limit=32768))
+            for key in ENVIRONMENT_KEYS
+            if key in environment
+        )
+        cwd = _safe_text(row.get("cwd"), limit=4096)
+        if (
+            not cwd.startswith("/")
+            or cwd.endswith(" (deleted)")
+            or type(row.get("ignore_hup")) is not bool
+        ):
+            raise LaunchError("SSH 工作目录 / 启动状态无效")
+        samples.append(
+            LaunchSample(
+                request,
+                pid,
+                argv,
+                selected,
+                cwd,
+                _stream(row.get("stdin")),
+                _stream(row.get("stdout")),
+                _stream(row.get("stderr")),
+                row["ignore_hup"],
+                _safe_text(row.get("nohup"), limit=4096),
+                _safe_text(row.get("namespace"), limit=128),
+                start,
+                _safe_text(row.get("matched_by"), limit=256),
+                time.monotonic(),
+            )
+        )
+    return tuple(samples)
+
+
+def replay_command(sample: LaunchSample) -> str:
+    """Emit bash/POSIX-compatible text. This function never executes it."""
+    if not sample.is_fresh():
+        raise LaunchError("SSH PID 未核实或数据已过期，不能生成可运行命令")
+    if any(
+        stream.kind == "unavailable"
+        for stream in (sample.stdin, sample.stdout, sample.stderr)
+    ):
+        raise LaunchError("存在管道、已删除文件或不可读描述符，无法完整复现重定向")
+    if sample.ignore_hup and (not sample.nohup.startswith("/") or not sample.nohup):
+        raise LaunchError("未能确认服务器上的 nohup 路径")
+    groups: list[list[str]] = [[]]
+    for arg in sample.argv:
+        if arg.startswith("--") and groups[-1]:
+            groups.append([])
+        if arg.startswith("--") and "=" in arg:
+            key, value = arg.split("=", 1)
+            # Quoting the entire argv element is always valid, including
+            # whitespace, metacharacters, quotes and Chinese paths.
+            groups[-1].append(shlex.quote(arg))
+        else:
+            groups[-1].append(shlex.quote(arg))
+    prefix = [f"{key}={shlex.quote(value)}" for key, value in sample.environment]
+    if sample.ignore_hup:
+        prefix.append(shlex.quote(sample.nohup))
+    groups[0] = prefix + groups[0]
+    redirects = []
+    if sample.stdin.kind in ("file", "null"):
+        redirects.append("< " + shlex.quote(sample.stdin.path))
+    if sample.stdout.kind in ("file", "null"):
+        redirects.append(
+            (">> " if sample.stdout.append else "> ") + shlex.quote(sample.stdout.path)
+        )
+    if sample.stderr.kind in ("file", "null"):
+        if (
+            sample.stderr.path == sample.stdout.path
+            and sample.stderr.append == sample.stdout.append
+        ):
+            redirects.append("2>&1")
+        else:
+            redirects.append(
+                ("2>> " if sample.stderr.append else "2> ")
+                + shlex.quote(sample.stderr.path)
+            )
+    if redirects:
+        groups.append(redirects)
+    command = " \\\n        ".join(" ".join(group) for group in groups if group)
+    if sample.ignore_hup:
+        command += " &"
+    return (
+        "(\n    cd -- " + shlex.quote(sample.cwd) + " || exit 1\n    " + command + "\n)"
+    )
+
+
+def fetch_samples(
+    config: training.TrainingConfig,
+    requests: tuple[LaunchRequest, ...],
+    stop: threading.Event | None = None,
+) -> tuple[LaunchSample, ...]:
+    if not config.target.startswith("yzh@"):
+        raise LaunchError("只允许查询 yzh 会话")
+    encoded = json.dumps(
+        [
+            dict(web_pid=req.web_pid, gpu=req.gpu, command=req.command)
+            for req in requests
+        ],
+        ensure_ascii=False,
+    )
+    if len(encoded.encode("utf-8")) > 65536:
+        raise LaunchError("进程请求过大")
+    remote = shlex.join(
+        ["python3", "-c", REMOTE_INSPECTOR, encoded, json.dumps(ENVIRONMENT_KEYS)]
+    )
+    environment = os.environ.copy()
+    environment.pop("LD_LIBRARY_PATH", None)
+    client = None
+    try:
+        client = subprocess.Popen(
+            training.ssh_command(config, remote),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            env=environment,
+            start_new_session=True,
+        )
+        deadline = time.monotonic() + config.timeout
+        while True:
+            if stop and stop.is_set():
+                raise LaunchError("SSH 核验已取消")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise LaunchError("SSH 进程核验超时")
+            try:
+                output, error = client.communicate(timeout=min(0.25, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        if client.returncode:
+            raise LaunchError(
+                "SSH 共享连接不可用；请先在终端建立监控所用连接。"
+                + error.strip()[-500:]
+            )
+        if len(output) > 512 * 1024:
+            raise LaunchError("SSH 进程响应过大")
+        return parse_samples(json.loads(output), requests)
+    except (OSError, ValueError, UnicodeError) as exc:
+        raise LaunchError("SSH 进程核验失败：" + str(exc)) from exc
+    finally:
+        if client is not None:
+            training._end_client(
+                client
+            )  # Only this reader, never the master or GPU process.
+
+
+class LaunchPoller(threading.Thread):
+    def __init__(
+        self,
+        events: queue.Queue[LaunchEvent],
+        config_path: str | Path,
+        *,
+        demo: bool = False,
+    ) -> None:
+        super().__init__(daemon=True, name="wn-a100-launch")
+        self.events, self.config_path, self.demo = events, config_path, demo
+        self.stop_event = threading.Event()
+        self.wake = threading.Event()
+        self.lock = threading.Lock()
+        self.requests: tuple[LaunchRequest, ...] = ()
+
+    def set_requests(self, requests: tuple[LaunchRequest, ...]) -> None:
+        with self.lock:
+            if requests != self.requests:
+                self.requests = requests
+                self.wake.set()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.wake.set()
+
+    def run(self) -> None:
+        while not self.stop_event.is_set():
+            self.wake.clear()
+            with self.lock:
+                requests = self.requests
+            if not requests:
+                self.wake.wait()
+                continue
+            try:
+                if self.demo:
+                    raise LaunchError("演示数据不查询 SSH，也不提供可执行复现命令")
+                samples = fetch_samples(
+                    training.load_config(self.config_path), requests, self.stop_event
+                )
+                event = LaunchEvent(requests, samples)
+            except (LaunchError, training.TrainingError) as exc:
+                event = LaunchEvent(requests, error=str(exc))
+            if self.stop_event.is_set():
+                break
+            with self.lock:
+                current = self.requests == requests
+            if current:
+                try:
+                    self.events.put_nowait(event)
+                except queue.Full:
+                    try:
+                        self.events.get_nowait()
+                    except queue.Empty:
+                        pass
+                    self.events.put_nowait(event)
+            self.wake.wait(10)

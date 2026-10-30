@@ -1,0 +1,23 @@
+{
+  "target": "yzh@192.168.1.50",
+  "port": 1143,
+  "jump": "jumper@cps.cslcqu.cn:6666",
+  "control_path": "{runtime_dir}/wn-a100-training.sock",
+  "interval": 10,
+  "timeout": 15,
+  "stale_after": 180,
+  "logs": [
+    {
+      "label": "任务 1",
+      "path": "/home/yzh/具身智能/训练日志/Lerobot/training_2.log",
+      "step_offset": 0,
+      "gpu_index": null
+    },
+    {
+      "label": "任务 2",
+      "path": "/home/yzh/具身智能/训练日志/Lerobot/training.log",
+      "step_offset": 0,
+      "gpu_index": null
+    }
+  ]
+}
