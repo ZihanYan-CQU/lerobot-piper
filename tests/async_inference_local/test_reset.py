@@ -102,6 +102,27 @@ def test_reset_holds_grasp_until_arm_stably_arrives_then_opens(pose_source, dura
         runtime.stop()
 
 
+def test_every_reset_phase_uses_planned_robot_entrypoint():
+    runtime, robot = setup_reset()
+    planned = []
+    move = robot.send_action
+
+    def send_planned(action):
+        planned.append(dict(action))
+        return move(action)
+
+    robot.send_action_planned = send_planned
+    robot.send_action = lambda action: pytest.fail("reset must not use the streaming sender")
+    try:
+        runtime.reset()
+        assert runtime.state == State.READY
+        assert planned == [command for _, _, command in robot.commands]
+        assert planned[0]["gripper.pos"] == pytest.approx(0.0167)
+        assert planned[-1]["gripper.pos"] == pytest.approx(0.07)
+    finally:
+        runtime.stop()
+
+
 def test_arm_reset_failure_does_not_release_grasp():
     runtime, robot = setup_reset()
     robot.stuck_joint = True

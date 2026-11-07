@@ -46,6 +46,18 @@ class CanBindingsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "不完整"):
             can.validate_expected(bindings, tokens[:1])
 
+    def test_either_role_can_be_configured_without_the_other_adapter(self):
+        self.assertEqual(
+            can.validate_bindings([self.master], self.master.usb, None, 1000000),
+            [(self.master, "can_master")],
+        )
+        self.assertEqual(
+            can.validate_bindings([self.follower], None, self.follower.usb, 1000000),
+            [(self.follower, "can_follower")],
+        )
+        with self.assertRaisesRegex(ValueError, "至少"):
+            can.validate_bindings(self.ports, None, None, 1000000)
+
     def test_discovery_only_lists_usb_can_interfaces(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -70,24 +82,14 @@ class CanBindingsTest(unittest.TestCase):
             self.assertEqual(ports[0].bitrate, 1000000)
             self.assertTrue(ports[0].up)
 
-    def exercise_activation(self, ports, *, fail_second=False, false_success=False):
+    def exercise_activation(self, ports, *, roles=("can_master", "can_follower"), fail_second=False, false_success=False):
         state = {port.usb: port for port in ports}
         calls = []
-        scripts = 0
+        configurations = 0
 
         def command(*args):
-            nonlocal scripts
+            nonlocal configurations
             calls.append(args)
-            if args[0] == "dpkg-query":
-                return "install ok installed"
-            if args[0] == "bash":
-                scripts += 1
-                if fail_second and scripts == 2:
-                    raise RuntimeError("activation failed")
-                if not false_success:
-                    _, _, target, bitrate, usb = args
-                    state[usb] = replace(state[usb], name=target, up=True, bitrate=int(bitrate))
-                return "script claims success"
             self.assertEqual(args[:4], ("ip", "link", "set", "dev"))
             port = next(port for port in state.values() if port.name == args[4])
             action = args[5]
@@ -95,27 +97,30 @@ class CanBindingsTest(unittest.TestCase):
                 self.assertFalse(any(other.name == args[6] and other.usb != port.usb for other in state.values()))
                 port = replace(port, name=args[6])
             elif action == "type":
+                configurations += 1
+                if fail_second and configurations == 2:
+                    raise RuntimeError("activation failed")
                 port = replace(port, bitrate=int(args[-1]))
             else:
                 self.assertIn(action, ("up", "down"))
-                port = replace(port, up=action == "up")
+                if not (false_success and action == "up"):
+                    port = replace(port, up=action == "up")
             state[port.usb] = port
             return ""
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            script = root / "can_activate.sh"
-            script.write_text("# fixture")
+            for port in ports:
+                (root / port.name).touch()
             with (
                 patch.object(can, "SYS_NET", root),
-                patch.object(can, "ACTIVATE_SCRIPT", script),
                 patch.object(can.os, "geteuid", return_value=0),
                 patch.object(can.shutil, "which", return_value="/usr/bin/tool"),
                 patch.object(can, "find_current", side_effect=lambda original: state[original.usb]),
                 patch.object(can, "run", side_effect=command),
                 redirect_stdout(io.StringIO()),
             ):
-                bindings = [(ports[0], "can_master"), (ports[1], "can_follower")]
+                bindings = [(port, role) for port, role in zip(ports, roles, strict=False) if role]
                 if fail_second or false_success:
                     with self.assertRaisesRegex(RuntimeError, "CAN 绑定失败"):
                         can.apply_bindings(bindings, 1000000)
@@ -123,13 +128,35 @@ class CanBindingsTest(unittest.TestCase):
                     can.apply_bindings(bindings, 1000000)
         return state, calls
 
-    def test_activation_uses_the_requested_script_arguments_and_skips_unchanged_port(self):
+    def test_activation_configures_selected_port_and_skips_unchanged_port(self):
         state, calls = self.exercise_activation(self.ports)
-        script_calls = [call for call in calls if call[0] == "bash"]
-        self.assertEqual(len(script_calls), 1)
-        self.assertEqual(script_calls[0][-3:], ("can_master", "1000000", "1-1.2:1.0"))
+        self.assertIn(("ip", "link", "set", "dev", "can_master", "type", "can", "bitrate", "1000000"), calls)
+        self.assertFalse(any(call[4] == "can_follower" for call in calls))
         self.assertEqual(state[self.master.usb].name, "can_master")
         self.assertTrue(state[self.master.usb].up)
+
+    def test_single_arm_activation_leaves_unselected_arm_unchanged(self):
+        for roles, selected in ((("can_master", None), 0), ((None, "can_follower"), 1)):
+            with self.subTest(roles=roles):
+                ports = [self.master, replace(self.follower, name="can1", bitrate=500000)]
+                state, calls = self.exercise_activation(ports, roles=roles)
+                self.assertEqual(state[ports[1 - selected].usb], ports[1 - selected])
+                self.assertEqual(state[ports[selected].usb].name, roles[selected])
+                self.assertTrue(state[ports[selected].usb].up)
+
+    def test_single_arm_rejects_a_name_occupied_by_an_unselected_adapter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "can_master").touch()
+            with (
+                patch.object(can, "SYS_NET", root),
+                patch.object(can.os, "geteuid", return_value=0),
+                patch.object(can.shutil, "which", return_value="/usr/bin/ip"),
+                patch.object(can, "run") as command,
+                self.assertRaisesRegex(ValueError, "未选择"),
+            ):
+                can.apply_bindings([(self.master, "can_master")], 1000000)
+            command.assert_not_called()
 
     def test_swapping_master_and_follower_frees_names_first(self):
         ports = [replace(self.master, name="can_follower", up=True), replace(self.follower, name="can_master")]
@@ -154,8 +181,26 @@ class CanBindingsTest(unittest.TestCase):
         ):
             self.assertEqual(can.main(["--dry-run"]), 0)
             activate.assert_not_called()
-            self.assertIn('can_master 1000000 "1-1.2:1.0"', output.getvalue())
-            self.assertIn('can_follower 1000000 "1-1.3:1.0"', output.getvalue())
+            self.assertIn("1-1.2:1.0 → can_master", output.getvalue())
+            self.assertIn("1-1.3:1.0 → can_follower", output.getvalue())
+
+    def test_explicit_single_role_does_not_add_the_other_default(self):
+        for option, port, name in (("--master", self.master, "can_master"), ("--follower", self.follower, "can_follower")):
+            with (
+                self.subTest(option=option),
+                patch.object(can, "discover_ports", return_value=[port]),
+                patch.object(can, "apply_bindings") as activate,
+            ):
+                self.assertEqual(can.main([option, port.usb]), 0)
+                activate.assert_called_once_with([(port, name)], 1000000)
+
+    def test_legacy_single_interface_mode_resolves_the_only_adapter(self):
+        with (
+            patch.object(can, "discover_ports", return_value=[self.master]),
+            patch.object(can, "apply_bindings") as activate,
+        ):
+            self.assertEqual(can.main(["--interface", "can0", "--bitrate", "500000"]), 0)
+            activate.assert_called_once_with([(self.master, "can0")], 500000)
 
 
 if __name__ == "__main__":

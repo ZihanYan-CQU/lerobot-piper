@@ -39,7 +39,7 @@ from collections import OrderedDict, deque
 from collections.abc import Iterator
 from concurrent import futures
 from contextlib import contextmanager, nullcontext, suppress
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from pprint import pformat
 from queue import Empty, Full, Queue
@@ -81,6 +81,8 @@ from ..shared.image_transport import (
     negotiate_image_transport,
     prepare_remote_observation,
 )
+from ..shared.rlt_config import RLTServerConfig
+from ..shared.rlt_remote import RLTSetup
 from ..shared.rtc_remote import (
     DEPLOYMENT_RTC_PROTOCOL_VERSION,
     RemoteRTCActionChunk,
@@ -553,6 +555,9 @@ class _RTCServer(_BasePolicyServer):
         """
 
         del request
+        if getattr(self, "_rlt_runtime", None) is not None:
+            result = self._rlt_runtime.get(context)
+            return services_pb2.Actions(data=pickle.dumps(result)) if result is not None else services_pb2.Actions()
         self._raise_worker_failure(context)
         wait_timeout = self.config.action_wait_timeout
         if context is not None:
@@ -964,6 +969,8 @@ class _RTCServer(_BasePolicyServer):
 class PolicyServerDeploymentConfig(_RTCServerConfig):
     """Resettable RTC server settings plus a one-entry warm model cache."""
 
+    rlt: RLTServerConfig = field(default_factory=RLTServerConfig)
+
     cuda_visible_devices: str | None = field(
         default=None,
         metadata={
@@ -1019,6 +1026,11 @@ class PolicyServerDeployment(_RTCServer):
     logger = get_logger(prefix)
 
     def __init__(self, config: PolicyServerDeploymentConfig):
+        if isinstance(config, _RTCServerConfig) and not isinstance(config, PolicyServerDeploymentConfig):
+            # Historical callers construct the common RTC config directly.
+            config = PolicyServerDeploymentConfig(**{
+                item.name: getattr(config, item.name) for item in fields(config) if item.init
+            })
         # Select GPUs before the server can load a policy or initialize CUDA.
         if config.cuda_visible_devices is not None:
             if (
@@ -1031,6 +1043,7 @@ class PolicyServerDeployment(_RTCServer):
                 )
             os.environ["CUDA_VISIBLE_DEVICES"] = config.cuda_visible_devices
         super().__init__(config)
+        self._rlt_runtime = None
         self._active_rollout_generation = -1
         self._policy_setup_lock = threading.Lock()
         self._cached_model_key: _ModelCacheKey | None = None
@@ -1053,6 +1066,10 @@ class PolicyServerDeployment(_RTCServer):
     def _reset_server(self) -> None:
         """Forget the rollout, but deliberately retain the warm policy runtime."""
 
+        runtime = getattr(self, "_rlt_runtime", None)
+        if runtime is not None:
+            runtime.close()
+            self._rlt_runtime = None
         super()._reset_server()
         self._active_rollout_generation = -1
         self._horizon_feedback_generation = -1
@@ -1397,6 +1414,17 @@ class PolicyServerDeployment(_RTCServer):
             return services_pb2.Empty()
 
         setup = pickle.loads(request.data)  # nosec
+        if isinstance(setup, RLTSetup):
+            from .rlt_runtime import RemoteRLTServer
+
+            with self._policy_setup_lock:
+                if self._inference_thread is not None or self._rlt_runtime is not None:
+                    raise RuntimeError("Call Ready before installing an RLT worker")
+                with self._diagnostic_phase("rlt_policy_runtime", device=setup.policy.device):
+                    self._rlt_runtime = RemoteRLTServer(self, setup, context)
+            return services_pb2.Empty()
+        if self.config.rlt.enabled:
+            raise ValueError("RLT server requires an RLT client setup")
         if not isinstance(setup, RemoteRTCPolicySetup):
             raise TypeError(f"RTC policy setup must be RemoteRTCPolicySetup, got {type(setup)}")
         if setup.protocol_version != DEPLOYMENT_RTC_PROTOCOL_VERSION:
@@ -1650,6 +1678,9 @@ class PolicyServerDeployment(_RTCServer):
             log_diagnostics=self.config.debug_rtc_diagnostics or self.config.debug_cuda_sync,
         )
         envelope = pickle.loads(received_bytes)  # nosec
+        if self._rlt_runtime is not None:
+            self._rlt_runtime.submit(envelope)
+            return services_pb2.Empty()
         if isinstance(envelope, RemoteRTCCalibrationRequest):
             with self._observation_publish_lock:
                 if (

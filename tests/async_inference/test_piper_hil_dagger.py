@@ -25,6 +25,7 @@ from lerobot.async_inference.client.piper_hil_dagger import (
     PiperDaggerController,
     PiperDaggerHardwareConfig,
     PiperDaggerHardwareError,
+    PiperDaggerRobotProxy,
     PiperHandoverAlignmentError,
 )
 from lerobot.utils.constants import ACTION, DEFAULT_FEATURES, OBS_STR
@@ -47,6 +48,7 @@ class _FakeBus:
         self.events = events
         self.pose = _pose(0.0) if pose is None else dict(pose)
         self.writes: list[list[float]] = []
+        self.planned_writes: list[list[float]] = []
         self.init_joint_position = [0.0] * 7
         self.piper = SimpleNamespace(
             get_firmware=lambda: {"software_version": firmware},
@@ -66,6 +68,10 @@ class _FakeBus:
         self.pose = _pose(0.0)
         self.events.append(f"{self.name}:home_as_follower")
         return True
+
+    def write(self, values):
+        self.planned_writes.append(list(values))
+        self.write_js(values)
 
     def write_js(self, values):
         values = list(values)
@@ -712,48 +718,6 @@ def test_prepare_autonomy_reasserts_master_follower_mode_and_waits_for_fresh_fee
     controller.close()
 
 
-@pytest.mark.parametrize("follower_first", [True, False])
-def test_optional_follower_gains_apply_only_to_autonomy_and_never_to_master_or_handover(follower_first):
-    events = []
-    follower_bus = _FakeBus("follower", events)
-    master_bus = _FakeBus("master", events)
-    robot = _FakePiperRobot(follower_bus)
-    robot.config.joint_control_mode = "mit"
-    tuned_commands = []
-
-    def tuned_write(values):
-        tuned_commands.append(list(values))
-        events.append("follower:mit")
-
-    robot.write_joint_command = tuned_write
-    controller = PiperDaggerController(
-        robot,
-        PiperDaggerHardwareConfig(
-            follower_first=follower_first, feedback_timeout_s=0.25, handover_gripper_settle_s=0.0
-        ),
-        master_bus=master_bus,
-        bridge=_FakeBridge(events),
-    )
-    assert tuned_commands == []  # Startup holds keep the native JS route.
-    events.clear()
-    controller.send_same_action(_pose(0.08))
-    assert tuned_commands == [[0.04] * 7]  # Shared EMA runs exactly once.
-    assert events == (["follower:mit", "master:write"] if follower_first else ["master:write", "follower:mit"])
-
-    controller.pause_computer_output()
-    controller.send_same_action(_pose(0.0))  # Paused reset commands use JS.
-    controller.enter_correction()
-    with pytest.raises(PiperDaggerHardwareError, match="computer command rejected"):
-        controller.send_same_action(_pose(0.08))
-    controller.leave_correction()
-    assert len(tuned_commands) == 1
-
-    controller.prepare_autonomy()
-    controller.send_same_action(_pose(0.08))
-    assert len(tuned_commands) == 2
-    controller.close()
-
-
 def test_controller_close_returns_master_home_before_disconnect():
     events: list[str] = []
     controller = PiperDaggerController(
@@ -1338,3 +1302,28 @@ def test_recorder_discards_failed_save_and_always_finalizes(monkeypatch, error_t
     assert dataset.saved == []
     assert calls == [{"parallel_encoding": False}]
     assert dataset.finalized
+
+
+@pytest.mark.parametrize("follower_first", [True, False])
+def test_proxy_reset_uses_planned_commands_on_both_arms(follower_first):
+    events = []
+    follower = _FakePiperRobot(_FakeBus("follower", events))
+    master = _FakeBus("master", events)
+    controller = PiperDaggerController(
+        follower,
+        PiperDaggerHardwareConfig(follower_first=follower_first),
+        master_bus=master,
+        bridge=_FakeBridge(events, master_bus=master, follower_bus=follower.bus),
+    )
+    controller._mode = PiperControlMode.PAUSED
+    proxy = PiperDaggerRobotProxy(follower, controller)
+    events.clear()
+    target = _pose(0.02)
+    assert proxy.send_action_planned(target) == target
+    assert master.planned_writes == [[0.02] * 7]
+    assert follower.bus.planned_writes == [[0.02] * 7]
+    expected = ["follower:write", "master:write"] if follower_first else ["master:write", "follower:write"]
+    assert events == expected
+    assert controller._ema_command == [0.02] * 7
+    assert follower._ema_cmd == [0.02] * 7
+    controller.close()

@@ -43,6 +43,7 @@ class _FakeBus:
         self.events = events
         self.pose = _pose(0.0) if pose is None else dict(pose)
         self.writes: list[list[float]] = []
+        self.planned_writes: list[list[float]] = []
         self.init_joint_position = [0.0] * 7
         self.piper = SimpleNamespace(
             get_firmware=lambda: {"software_version": firmware},
@@ -63,6 +64,10 @@ class _FakeBus:
         self.pose = _pose(0.0)
         self.events.append(f"{self.name}:home_as_follower")
         return True
+
+    def write(self, values):
+        self.planned_writes.append(list(values))
+        self.write_js(values)
 
     def write_js(self, values):
         values = list(values)
@@ -141,6 +146,30 @@ class _FakePiperRobot:
 
     def get_observation(self):
         return dict(self.bus.pose)
+
+
+@pytest.mark.parametrize("follower_first", [True, False])
+def test_reset_uses_planned_commands_on_both_arms(follower_first):
+    events = []
+    follower = _FakePiperRobot(_FakeBus("follower", events))
+    master = _FakeBus("master", events)
+    controller = PiperDaggerController(
+        follower,
+        PiperDaggerHardwareConfig(follower_first=follower_first),
+        master_bus=master,
+        bridge=_FakeBridge(events, master_bus=master, follower_bus=follower.bus),
+    )
+    controller._mode = PiperControlMode.PAUSED
+    events.clear()
+    target = _pose(0.02)
+    assert controller.send_planned_action(target) == target
+    assert master.planned_writes == [[0.02] * 7]
+    assert follower.bus.planned_writes == [[0.02] * 7]
+    expected = ["follower:write", "master:write"] if follower_first else ["master:write", "follower:write"]
+    assert events == expected
+    assert controller._ema_command == [0.02] * 7
+    assert follower._ema_cmd == [0.02] * 7
+    controller.close()
 
 
 def test_can_bridge_forwards_only_physical_standard_control_frames():

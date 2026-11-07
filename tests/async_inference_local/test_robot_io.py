@@ -5,7 +5,38 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from lerobot.async_inference_local.control.dagger_io import DaggerRobotIO
+from lerobot.async_inference_local.control.piper_dagger import PiperDaggerHardwareConfig
 from lerobot.async_inference_local.control.robot_io import RobotIO
+
+
+@pytest.mark.parametrize("has_planned", [False, True])
+def test_reset_uses_optional_planned_sender_and_stream_remains_independent(has_planned):
+    robot = piper({})
+    calls = []
+    robot.send_action = lambda action: calls.append("stream") or action
+    if has_planned:
+        robot.send_action_planned = lambda action: calls.append("planned") or action
+    io = RobotIO(robot)
+    target = np.array([0.02], dtype=np.float32)
+    np.testing.assert_array_equal(io.send_planned(target), target)
+    np.testing.assert_array_equal(io.send(target), target)
+    assert calls == ["planned" if has_planned else "stream", "stream"]
+
+
+def test_dual_arm_io_routes_reset_to_controller_instead_of_follower_alone():
+    robot = piper({})
+    robot.send_action_planned = lambda action: pytest.fail("reset must reach both arms")
+    calls = []
+    io = DaggerRobotIO(robot, PiperDaggerHardwareConfig())
+    io.controller = SimpleNamespace(
+        send_same_action=lambda action: calls.append("stream") or action,
+        send_planned_action=lambda action: calls.append("planned") or action,
+    )
+    target = np.array([0.02], dtype=np.float32)
+    np.testing.assert_array_equal(io.send_planned(target), target)
+    np.testing.assert_array_equal(io.send(target), target)
+    assert calls == ["planned", "stream"]
 
 
 def test_piper_camera_wait_does_not_hold_motor_lock_and_snapshot_owns_image():
@@ -131,6 +162,43 @@ def test_command_expiring_while_waiting_for_motor_lock_is_not_sent(monkeypatch):
     sender.join(1)
     assert not sent
     assert len(errors) == 1 and isinstance(errors[0], TimeoutError)
+
+
+@pytest.mark.parametrize("dual_arm", [False, True])
+@pytest.mark.parametrize("reason", ["cancelled", "expired"])
+def test_send_guards_are_checked_after_waiting_for_lock_on_both_adapters(monkeypatch, dual_arm, reason):
+    from lerobot.async_inference_local.control import robot_io
+
+    clock = [10.0]
+    monkeypatch.setattr(robot_io.time, "monotonic", lambda: clock[0])
+    robot = piper({})
+    sent, errors, entered, stop = [], [], threading.Event(), threading.Event()
+    robot.send_action = lambda action: sent.append(action) or action
+    if dual_arm:
+        io = DaggerRobotIO(robot, PiperDaggerHardwareConfig())
+        io.controller = SimpleNamespace(send_same_action=robot.send_action)
+    else:
+        io = RobotIO(robot)
+
+    def dispatch():
+        entered.set()
+        try:
+            io.send(np.array([2], dtype=np.float32), deadline=10.1, stop_event=stop)
+        except Exception as exc:
+            errors.append(exc)
+
+    with io._motor_lock:
+        worker = threading.Thread(target=dispatch)
+        worker.start()
+        assert entered.wait(1)
+        if reason == "cancelled":
+            stop.set()
+        else:
+            clock[0] = 10.2
+    worker.join(1)
+    assert not worker.is_alive() and not sent
+    expected = InterruptedError if reason == "cancelled" else TimeoutError
+    assert len(errors) == 1 and isinstance(errors[0], expected)
 
 
 def test_fault_cleanup_attempts_all_cameras_even_if_one_fails():

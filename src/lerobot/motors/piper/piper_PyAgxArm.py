@@ -60,16 +60,6 @@ def visual_pad(text: str, target_width: int, align: str = "<") -> str:
         right = pad_total - left
         return " " * left + text + " " * right
 
-def fmt_row(data):
-    return " ".join(f"{v:^4}" for v in data)
-
-def move_cursor_up(lines):
-    """Move the cursor up by a specified number of lines."""
-    print(f"\033[{lines}A", end="")
-
-def move_cursor_down(lines):
-    """Move the cursor down by a specified number of lines."""
-    print(f"\033[{lines}B", end="")
 
 def is_joint_target_reached(current_joints, target_joints, tolerance=0.02):
     """
@@ -121,6 +111,7 @@ class PiperMotorsBus:
     '''
 
     def write(self, target_position:list):
+        """Use SDK joint planning for one-shot positioning and home returns."""
     
         target_joint = target_position[:-1]
         gripper_range = target_position[-1]
@@ -129,6 +120,7 @@ class PiperMotorsBus:
         self.end_effector.move_gripper_m(value=abs(gripper_range), force=1.0) 
 
     def write_js(self, target_position:list):
+        """Stream continuous joint references without SDK trajectory planning."""
         
         target_joint = target_position[:-1]
         gripper_range = target_position[-1]

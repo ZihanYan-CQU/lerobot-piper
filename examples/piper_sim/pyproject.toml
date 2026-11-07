@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=71"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lerobot_robot_piper_mujoco"
+version = "0.1.0"
+description = "An isolated MuJoCo Piper backend for LeRobot, including leader-arm recording"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # ACT uses core LeRobot; training includes dataset, and piper supports a real leader.
+    # core_scripts/evaluation also provide the standard LeRobot CLI commands.
+    "lerobot[training,core_scripts,piper,evaluation]>=0.6.0",
+    "mujoco>=3.3.7,<4",
+    "numpy>=2,<2.3",
+    "gymnasium>=1",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.1.0,<10.0.0"]
+
+[project.scripts]
+piper-sim = "lerobot_robot_piper_mujoco.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["lerobot_robot_piper_mujoco*"]
+
+[tool.uv]
+python-preference = "only-managed"
+
+[[tool.uv.index]]
+name = "tuna"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+lerobot = { path = "../..", editable = true }
+# Keep the independently locked project on the same SDK revision and CUDA wheel source.
+pyagxarm = { git = "https://github.com/agilexrobotics/pyAgxArm.git", rev = "4b0f06585db3324222616999afeda9037df2e8bd" }
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]

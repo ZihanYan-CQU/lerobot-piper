@@ -1,1 +1,1 @@
-"""WN-A100 desktop monitor. Use the numbered launcher or `python -m lerobot.yzh.wn_a100`."""
+"""Self-contained WN-A100 monitor; run this directory or `python -m lerobot.yzh.wn_a100`."""

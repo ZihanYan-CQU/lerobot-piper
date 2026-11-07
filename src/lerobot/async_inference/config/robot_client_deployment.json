@@ -20,14 +20,15 @@
         "rotation": 180
       }
     },
-    "teleop_gripper_alpha": 0.25,
-    "teleop_joint_alpha": 0.25
+    "teleop_gripper_alpha": 1,
+    "teleop_joint_alpha": 1
+    
   },
   "policy_type": "pi05",
-  "pretrained_name_or_path": "/home/yzh/具身智能/微调模型/Lerobot/pi0.5_shapeMatching_b32_s20000/checkpoints/020000/pretrained_model",
+  "pretrained_name_or_path": "/home/yzh/具身智能/微调模型/Lerobot/pi0.5_shapeMatching_b64_s20000_lang_lora_attn_mlp__vision_frozen__expert_full_fp32_ampbf16_Rlinf/merged_020000",
   "policy_device": "cuda",
   "actions_per_chunk": 50,
-  "chunk_size_threshold": 1.0,
+  "chunk_size_threshold": 0.5,
   "fps": 30,
   "interpolation_multiplier": 2,
   "adaptive_rtt_trigger": true,
@@ -37,7 +38,7 @@
   "reset_fps": 50,
   "rtc_mode": "guided",
   "resize_images_on_client": true,
-  "image_transport_mode": "openpi_uint8",
+  "image_transport_mode": "lerobot_float32",
   "continuous_observation": true,
   "observation_max_age_s": 0.1,
   "startup_calibration_runs": 3,

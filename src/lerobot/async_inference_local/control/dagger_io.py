@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from threading import RLock
+from threading import Event, RLock
 
 import numpy as np
 
@@ -56,17 +56,28 @@ class DaggerRobotIO(RobotIO):
             raise TimeoutError("Correction observation is stale")
         return values
 
-    def send(self, values: np.ndarray, *, deadline: float | None = None) -> np.ndarray:
+    def send(
+        self, values: np.ndarray, *, deadline: float | None = None, stop_event: Event | None = None
+    ) -> np.ndarray:
         """Apply exactly one common filtered target to both arms."""
+        return self._send(values, deadline=deadline, planned=False, stop_event=stop_event)
+
+    def send_planned(self, values: np.ndarray) -> np.ndarray:
+        """Send reset waypoints through joint planning on both arms."""
+        return self._send(values, deadline=None, planned=True)
+
+    def _send(
+        self, values: np.ndarray, *, deadline: float | None, planned: bool, stop_event: Event | None = None
+    ) -> np.ndarray:
         if values.shape != (len(self.action_keys),) or not np.isfinite(values).all():
             raise ValueError("Invalid robot command shape or values")
         requested = dict(zip(self.action_keys, map(float, values), strict=True))
         with self._motor_lock:
             if self._closed:
                 raise RuntimeError("DAgger hardware is disconnected")
-            if deadline is not None and time.monotonic() > deadline:
-                raise TimeoutError("Action source expired while waiting for motor I/O")
-            applied = self._validate_pose(self.controller.send_same_action(requested))
+            sender = self.controller.send_planned_action if planned else self.controller.send_same_action
+            self._check_send_guard(deadline, stop_event)
+            applied = self._validate_pose(sender(requested))
         return np.asarray([applied[key] for key in self.action_keys], dtype=np.float32)
 
     def read_reset_poses(self, timeout_s: float) -> dict[str, dict[str, float]]:

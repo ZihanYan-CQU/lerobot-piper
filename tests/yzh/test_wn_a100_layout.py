@@ -1,4 +1,4 @@
-"""Consolidated layout, old launchers and config migration (no real servers)."""
+"""Self-contained layout, directory / package launch and autostart (no servers)."""
 
 from __future__ import annotations
 
@@ -30,10 +30,11 @@ def test_only_three_business_modules_and_two_package_entry_files():
     }
     assert not any(
         (YZH / f"wn_a100_{name}.py").exists()
-        for name in ("training", "disk", "ssh", "desktop", "launch")
+        for name in ("monitor", "training", "disk", "ssh", "desktop", "launch")
     )
+    assert not (YZH / "2.wn_a100_monitor.py").exists()
     assert (PACKAGE / "README.md").is_file()
-    assert (PACKAGE / "archive/launch_prototype.py.txt").is_file()
+    assert not (PACKAGE / "archive/launch_prototype.py.txt").exists()
     assert not (YZH / "wn_a100_training.json").exists()
     assert not (YZH / "WN_A100_MONITOR.md").exists()
 
@@ -64,11 +65,12 @@ def test_config_is_single_canonical_file_and_console_entry_uses_new_package():
     )
 
 
-def test_old_bundled_config_argument_is_redirected_without_recreating_it(monkeypatch):
+def test_removed_config_path_is_not_a_hidden_default_alias(monkeypatch):
     legacy = YZH / "wn_a100_training.json"
     monkeypatch.chdir(ROOT)
     for path in (legacy, legacy.relative_to(ROOT)):
-        assert remote.load_config(path) == remote.load_config()
+        with pytest.raises(remote.RemoteError, match="配置不可用"):
+            remote.load_config(path)
     assert not legacy.exists()
 
 
@@ -86,7 +88,7 @@ def test_existing_custom_config_with_old_filename_is_honored(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "entry", ["numbered", "old_script", "package", "old_console_import"]
+    "entry", ["directory", "entry_file", "package", "console_target"]
 )
 @pytest.mark.parametrize("mode", ["--once", "--training-once", "--disk-once"])
 def test_all_supported_entry_points_work_from_another_directory_without_gui(
@@ -95,10 +97,10 @@ def test_all_supported_entry_points_work_from_another_directory_without_gui(
     environment = os.environ.copy()
     environment.pop("PYTHONPATH", None)
     environment.pop("LD_LIBRARY_PATH", None)
-    if entry == "numbered":
-        command = [str(YZH / "2.wn_a100_monitor.py")]
-    elif entry == "old_script":
-        command = [str(YZH / "wn_a100_monitor.py")]
+    if entry == "directory":
+        command = [str(PACKAGE)]
+    elif entry == "entry_file":
+        command = [str(PACKAGE / "__main__.py")]
     elif entry == "package":
         environment["PYTHONPATH"] = str(ROOT / "src")
         command = ["-m", "lerobot.yzh.wn_a100"]
@@ -106,7 +108,7 @@ def test_all_supported_entry_points_work_from_another_directory_without_gui(
         environment["PYTHONPATH"] = str(ROOT / "src")
         command = [
             "-c",
-            "from lerobot.yzh.wn_a100_monitor import main; raise SystemExit(main())",
+            "from lerobot.yzh.wn_a100.monitor import main; raise SystemExit(main())",
         ]
     result = subprocess.run(
         [sys.executable, *command, mode, "--demo", "--json"],
@@ -148,10 +150,12 @@ def test_headless_import_does_not_load_qt_or_removed_modules(tmp_path):
     assert result.returncode == 0, result.stderr
 
 
-def test_generated_autostart_uses_stable_absolute_launcher_and_new_config(
+def test_generated_autostart_uses_direct_uv_command_and_new_config(
     tmp_path, monkeypatch
 ):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "settings"))
+    uv_command = [str(tmp_path / "uv"), "run", "--no-sync", "python", "-m", "lerobot.yzh.wn_a100"]
+    monkeypatch.setattr(monitor, "project_uv_command", lambda: uv_command.copy())
     args = monitor.build_parser().parse_args(["--no-training", "--no-topmost"])
     destination = monitor.install_autostart(args)
     command = shlex.split(
@@ -161,19 +165,7 @@ def test_generated_autostart_uses_stable_absolute_launcher_and_new_config(
             if line.startswith("Exec=")
         )
     )
-    assert command[:2] == [sys.executable, str(YZH / "2.wn_a100_monitor.py")]
+    assert command[: len(uv_command)] == uv_command
+    assert sys.executable not in command
     assert "--no-training" in command and "--no-topmost" in command
     assert command[command.index("--training-config") + 1] == str(remote.DEFAULT_CONFIG)
-    environment = os.environ.copy()
-    environment.pop("PYTHONPATH", None)
-    environment.pop("LD_LIBRARY_PATH", None)
-    result = subprocess.run(
-        [*command, "--once", "--demo", "--json"],
-        cwd=tmp_path,
-        env=environment,
-        text=True,
-        capture_output=True,
-        timeout=10,
-    )
-    assert result.returncode == 0, result.stderr
-    assert len(json.loads(result.stdout)["gpus"]) == 8

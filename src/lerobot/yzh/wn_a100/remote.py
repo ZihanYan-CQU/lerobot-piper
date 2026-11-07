@@ -362,11 +362,6 @@ def _training_processes(value: Any) -> tuple[TrainingProcess, ...]:
 def load_config(path: str | Path = DEFAULT_CONFIG) -> RemoteConfig:
     try:
         path = Path(path)
-        # Only the exact former bundled path is a migration alias. Missing
-        # custom configurations must still fail, never silently use defaults.
-        legacy = Path(__file__).resolve().parent.parent / "wn_a100_training.json"
-        if not path.exists() and path.resolve() == legacy:
-            path = DEFAULT_CONFIG
         raw = json.loads(path.read_text(encoding="utf-8"))
         target = str(raw["target"])
         jump = str(raw["jump"])

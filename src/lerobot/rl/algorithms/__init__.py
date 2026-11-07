@@ -12,9 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .rlt_ac import RLTACAlgorithm, RLTACConfig
 from .sac import SACAlgorithm, SACAlgorithmConfig
 
 __all__ = [
     "SACAlgorithm",
     "SACAlgorithmConfig",
+    "RLTACAlgorithm",
+    "RLTACConfig",
 ]

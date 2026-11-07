@@ -7,7 +7,6 @@ from functools import cached_property
 from typing import Any
 
 from lerobot.cameras.utils import make_cameras_from_configs
-from lerobot.motors.piper.mit_controller import MITPositionSettings, PiperMITPositionController
 from lerobot.motors.piper.piper_PyAgxArm import PiperMotorsBus, PiperMotorsBusConfig, visual_pad
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
@@ -45,7 +44,6 @@ class PIPERFollower(Robot):
         self._is_calibrated = False
         self.cameras = make_cameras_from_configs(config.cameras)
         self._ema_cmd: list[float] | None = None
-        self._mit_controller: PiperMITPositionController | None = None
 
     @property
     def camera_features(self) -> dict:
@@ -155,7 +153,6 @@ class PIPERFollower(Robot):
 
         self._is_connected = False
         self._ema_cmd = None
-        self._mit_controller = None
         print('└' + '─' * (self.bus.LOG_END_LENGTH -2) + '┘')
 
     def calibrate(self):
@@ -166,7 +163,6 @@ class PIPERFollower(Robot):
         self.bus.apply_calibration_follower()
         self._is_calibrated = True  # 标记为已标定
         self._ema_cmd = None
-        self._mit_controller = None
 
     def get_observation(self) -> dict:
         """Capture current joint positions and camera images"""
@@ -204,35 +200,15 @@ class PIPERFollower(Robot):
         motor_order = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "gripper"]
         self._ema_cmd = [float(pose[f"{motor}.pos"]) for motor in motor_order]
 
-    def write_joint_command(self, command: list[float], *, follower_mode: bool = False) -> None:
-        """Send an already-filtered command through the configured follower backend.
-
-        DAgger calls this after its shared EMA, so this method must not filter
-        again. Its master arm and physical correction bridge do not use it.
-        """
+    def send_action_planned(self, action: dict[str, float]) -> dict[str, float]:
+        """Send reset/positioning targets through SDK joint planning, without streaming EMA."""
         if not self._is_connected:
             raise DeviceNotConnectedError("Piper is not connected.")
-        if getattr(self.config, "joint_control_mode", "native") == "mit":
-            if self._mit_controller is None:
-                self._mit_controller = PiperMITPositionController(
-                    self.bus.piper,
-                    self.bus.end_effector,
-                    self.bus.cfg["joint_limits"],
-                    MITPositionSettings(
-                        self.config.mit_kp, self.config.mit_kd, self.config.mit_torque_ff,
-                        self.config.mit_max_tracking_error, self.config.mit_feedback_max_age_s,
-                    ),
-                )
-                logger.warning(
-                    "Experimental follower MIT gains enabled: kp=%s kd=%s torque_ff=%s; "
-                    "velocity reference is zero; constant torque_ff is not a gravity model",
-                    self.config.mit_kp, self.config.mit_kd, self.config.mit_torque_ff,
-                )
-            self._mit_controller.send(command)
-        elif follower_mode:
-            self.bus.write_js(command)
-        else:
-            self.bus.write(command)
+        motor_order = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "gripper"]
+        command = [float(action[f"{motor}.pos"]) for motor in motor_order]
+        self.bus.write(command)
+        self._ema_cmd = list(command)
+        return {f"{motor}.pos": command[index] for index, motor in enumerate(motor_order)}
 
     def send_action_js(self, action: dict[str, float]) -> dict[str, float]:
         """Receive action dict from record() and send to motor"""
@@ -260,10 +236,7 @@ class PIPERFollower(Robot):
             self._ema_cmd[6] = ga * target_joints[6] + (1.0 - ga) * self._ema_cmd[6]
             cmd = self._ema_cmd
 
-        if getattr(self.config, "joint_control_mode", "native") == "mit":
-            self.write_joint_command(cmd, follower_mode=True)
-        else:
-            self.bus.write_js(cmd)
+        self.bus.write_js(cmd)
         return {f"{motor_order[i]}.pos": cmd[i] for i in range(len(motor_order))}
 
     def send_action(self, action: dict[str, float]) -> dict[str, float]:
@@ -292,10 +265,7 @@ class PIPERFollower(Robot):
             self._ema_cmd[6] = ga * target_joints[6] + (1.0 - ga) * self._ema_cmd[6]
             cmd = self._ema_cmd
 
-        if getattr(self.config, "joint_control_mode", "native") == "mit":
-            self.write_joint_command(cmd)
-        else:
-            self.bus.write(cmd)
+        self.bus.write_js(cmd)
         return {f"{motor_order[i]}.pos": cmd[i] for i in range(len(motor_order))}
 
     def temperature_monitor_log(self) -> dict[str,list]:

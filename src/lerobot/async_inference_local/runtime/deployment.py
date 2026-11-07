@@ -231,6 +231,13 @@ class LocalDeployment:
             self._fault("reset", exc)
             raise
 
+    def _send_reset_action(self, values: np.ndarray) -> None:
+        planned = getattr(self.io, "send_planned", None)
+        if callable(planned):
+            planned(values)
+        else:
+            self.io.send(values)
+
     def _restore_pose(self, target: dict[str, float] | None, generation: int) -> None:
         with self._command_lock:
             with self._condition:
@@ -258,7 +265,7 @@ class LocalDeployment:
                 with self._condition:
                     if self._state != State.RESETTING or generation != self._generation:
                         return
-                self.io.send(before + (after - before) * (index / steps))
+                self._send_reset_action(before + (after - before) * (index / steps))
             if self.config.reset_duration_s and self.stop_event.wait(max(0.0, deadline - time.monotonic())):
                 return
         if not self._wait_for_reset_pose(target, generation, verify_gripper=not gripper_targets):
@@ -283,8 +290,8 @@ class LocalDeployment:
                 with self._condition:
                     if self._state != State.RESETTING or generation != self._generation:
                         return False
-                # Keep advancing driver smoothing, then verify actual feedback.
-                self.io.send(after)
+                # Reassert the planned target, then verify actual feedback.
+                self._send_reset_action(after)
                 poses = self.io.read_reset_poses(max(0.001, settle_until - time.monotonic()))
                 if not poses:
                     raise ValueError("Reset requires physical feedback")

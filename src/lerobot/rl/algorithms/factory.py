@@ -63,6 +63,10 @@ def get_algorithm_class(name: str) -> type[RLAlgorithm]:
         from .sac.sac_algorithm import SACAlgorithm
 
         return SACAlgorithm
+    if name == "rlt_ac":
+        from .rlt_ac import RLTACAlgorithm
+
+        return RLTACAlgorithm
     raise ValueError(
         f"Algorithm type '{name}' is not available. "
         f"Known: {list(RLAlgorithmConfig.get_known_choices().keys())}"

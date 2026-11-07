@@ -1,4 +1,8 @@
-**RECAP 与 RLinf 调研：面向当前 Piper / Pi05 / RTC 项目的集成方案**
+# RECAP 与 RLinf 调研：Piper / Pi05 / RTC 集成方案
+
+[研究索引](README.md) · [已实现的 RECAP 数据约定](../architecture/recap.md) · [RECAP 采集流程](../workflows/recap/README.md)
+
+本文保留 2026-10-13 的调研判断及文内后续更新；当时的缺口与集成建议不是当前实现状态清单。实际采集实现以架构和流程文档为准。
 
 调研日期：2026-10-13。结论来自论文、维护者文档、公开源码及本地代码检查；未运行外部训练、转换现有数据或连接机器人。下文的接入设计、优先级和工期是针对本项目的工程判断。
 
@@ -6,7 +10,7 @@
 
 **建议优先在现有 LeRobot 中实现离线 RECAP，参考 Evo-RL 的模块划分；将 RLinf 作为可独立运行的价值标注后端和后续分布式训练基础设施。** 当前最先需要补齐的是完整任务轨迹及结果标签。现有“纠正片段 + 干预比例采样 + 离线微调”可以作为对照基线，但还不是 RECAP。
 
-**1. RECAP 到底需要实现什么**
+## 1. RECAP 到底需要实现什么
 
 这里的 RECAP 指 Physical Intelligence 在 π*0.6 中提出的 **RL with Experience and Corrections via Advantage-conditioned Policies**。完整流程是：收集轨迹与任务结果，训练价值函数，估计动作优势，为策略增加优势条件，部署后继续收集。原论文采用分轮离线更新；人工纠正可以加入，但并非每轮都必须有。因此，第一版无需同时实现机器人在线采集、价值更新和策略更新。论文中的 π0.6 基座与本项目 Pi05 不同，在 Pi05 上实现该训练方法，应称为“Pi05 + RECAP”，不能据此宣称复现了官方 π*0.6 模型。[原论文](https://arxiv.org/html/2511.14759v1)
 
@@ -25,24 +29,24 @@
 
 第一版推理可以固定使用正优势条件。条件丢弃让模型同时学会有条件和无条件行为；需要更强引导时再评估 CFG。CFG 与 RTC 分别控制行为偏好和跨动作块的连续执行，集成时要分别配置和验证。[论文的条件推理说明](https://arxiv.org/html/2511.14759v1#A1.SS5)
 
-**2. 本项目已经具备哪些基础**
+## 2. 本项目已经具备哪些基础
 
 | 能力 | 本地证据 | 集成含义 |
 | --- | --- | --- |
-| Piper 驱动、主从控制和人工接管 | [piper_hil_dagger.py](/home/cpy/桌面/yzh/piper/lerobot/src/lerobot/async_inference/client/piper_hil_dagger.py:1151) | 可以复用现有控制权交接、CAN 桥和故障处理 |
+| Piper 驱动、主从控制和人工接管 | [piper_hil_dagger.py](../../src/lerobot/async_inference/client/piper_hil_dagger.py#L1151) | 可以复用现有控制权交接、CAN 桥和故障处理 |
 | 纠正窗口录制 | 同文件的 `DaggerCorrectionRecorder`，每次 `begin/end` 成为一个 episode | episode 不一定是完整任务；自主段未保存，不能直接生成可信任务回报 |
-| 干预帧字段 | [录制 schema](/home/cpy/桌面/yzh/piper/lerobot/src/lerobot/async_inference/client/piper_hil_dagger.py:1213) | 已有 `intervention: bool[1]`，但没有完整任务结果及优势字段 |
-| 演示与纠正混合采样 | [lerobot_train.py](/home/cpy/桌面/yzh/piper/lerobot/src/lerobot/scripts/lerobot_train.py:360) | 可复用 `intervention_sampling_ratio`，新增自主轨迹后需能区分三种数据来源 |
-| 预训练归一化统计量沿用 | [训练处理器构建](/home/cpy/桌面/yzh/piper/lerobot/src/lerobot/scripts/lerobot_train.py:127) | 可减少迭代微调时动作尺度变化 |
-| Pi05 的文本/状态预处理 | [processor_pi05.py](/home/cpy/桌面/yzh/piper/lerobot/src/lerobot/policies/pi05/processor_pi05.py:48) | 优势条件可以在 tokenizer 前注入，第一版可保留模型结构 |
-| Guided / trained RTC | [modeling_pi05.py](/home/cpy/桌面/yzh/piper/lerobot/src/lerobot/policies/pi05/modeling_pi05.py:769) | 本地已有自定义 hard-prefix 推理和训练 loss mask，外部模型不能假定兼容 |
-| RL 算法入口 | [rl/algorithms/factory.py](/home/cpy/桌面/yzh/piper/lerobot/src/lerobot/rl/algorithms/factory.py:46) | 当前工厂只实现 SAC，不能靠修改算法名称启用 RECAP |
-| 奖励模型与样本权重 | [rewards](/home/cpy/桌面/yzh/piper/lerobot/src/lerobot/rewards/factory.py)、[训练样本权重](/home/cpy/桌面/yzh/piper/lerobot/src/lerobot/scripts/lerobot_train.py:241) | 可用于结果辅助标注或对照实验；奖励/进度模型不是经过当前回报定义训练的价值函数 |
-| LeRobot v3 数据格式 | [dataset_metadata.py](/home/cpy/桌面/yzh/piper/lerobot/src/lerobot/datasets/dataset_metadata.py:61) | 外部 v2.1 路径、跨文件 episode 和 metadata 布局需要适配 |
+| 干预帧字段 | [录制 schema](../../src/lerobot/async_inference/client/piper_hil_dagger.py#L1213) | 已有 `intervention: bool[1]`，但没有完整任务结果及优势字段 |
+| 演示与纠正混合采样 | [lerobot_train.py](../../src/lerobot/scripts/lerobot_train.py#L360) | 可复用 `intervention_sampling_ratio`，新增自主轨迹后需能区分三种数据来源 |
+| 预训练归一化统计量沿用 | [训练处理器构建](../../src/lerobot/scripts/lerobot_train.py#L127) | 可减少迭代微调时动作尺度变化 |
+| Pi05 的文本/状态预处理 | [processor_pi05.py](../../src/lerobot/policies/pi05/processor_pi05.py#L48) | 优势条件可以在 tokenizer 前注入，第一版可保留模型结构 |
+| Guided / trained RTC | [modeling_pi05.py](../../src/lerobot/policies/pi05/modeling_pi05.py#L769) | 本地已有自定义 hard-prefix 推理和训练 loss mask，外部模型不能假定兼容 |
+| RL 算法入口 | [rl/algorithms/factory.py](../../src/lerobot/rl/algorithms/factory.py#L46) | 当前工厂只实现 SAC，不能靠修改算法名称启用 RECAP |
+| 奖励模型与样本权重 | [rewards](../../src/lerobot/rewards/factory.py)、[训练样本权重](../../src/lerobot/scripts/lerobot_train.py#L241) | 可用于结果辅助标注或对照实验；奖励/进度模型不是经过当前回报定义训练的价值函数 |
+| LeRobot v3 数据格式 | [dataset_metadata.py](../../src/lerobot/datasets/dataset_metadata.py#L61) | 外部 v2.1 路径、跨文件 episode 和 metadata 布局需要适配 |
 
-本地全局检索中，RECAP 只出现在 HIL 文档的论文介绍，没有找到对应训练算法。现有 DAgger 的工作边界也明确写在 [README_DAGGER.md](/home/cpy/桌面/yzh/piper/lerobot/src/lerobot/yzh/README_DAGGER.md:5)。
+本地全局检索中，RECAP 只出现在 HIL 文档的论文介绍，没有找到对应训练算法。现有 DAgger 的工作边界也明确写在 [DAgger 架构](../architecture/dagger.md)。
 
-**3. 开源实现的实际状态与取舍**
+## 3. 开源实现的实际状态与取舍
 
 | 项目 | 核实到的实现状态 | 对本项目的价值与限制 |
 | --- | --- | --- |
@@ -67,7 +71,7 @@ RLinf 配方默认 `positive_only_conditional=true`、`unconditional_prob=0.1`�
 
 RLinf 当前优势脚本对所配置的数据集合计算统一阈值；Evo-RL 按任务计算阈值。因此，跨任务混合数据不宜不加检查地交换二值标签。建议保留连续优势，再由本项目按选定协议生成 indicator。[RLinf 优势计算](https://github.com/RLinf/RLinf/blob/abdc6f8d52b830db5512bb95725927b20542cfb6/examples/offline_rl/advantage_labeling/recap/process/compute_advantages.py)
 
-**4. RLinf 基础设施对本项目的具体作用**
+## 4. RLinf 基础设施对本项目的具体作用
 
 RLinf 把执行过程分成可放置在不同节点/GPU 的 Worker，使用 WorkerGroup 管理同类进程、Channel 传递数据，Runner 编排训练流程。机器人应用里通常把 `env` 放在控制节点，`rollout` 负责模型推理，`actor` 负责学习更新。这里的 actor 是训练角色，不是本项目 `RobotClient` 的同义词。[执行流程](https://rlinf.readthedocs.io/en/latest/rst_source/concepts/execution_flow.html)、[真机节点配置](https://rlinf.readthedocs.io/en/latest/rst_source/guides/realworld_robot.html)
 
@@ -87,7 +91,7 @@ RLinf-USER 已展示 Franka 等真机上的 SAC、RLPD、SAC-Flow、HG-DAgger �
 
 跨公网接入时还需要处理 Ray 节点间双向可达。当前一个策略服务端口或 SSH 转发能够工作，不表示整个 Ray 集群已经可用；官方云边指南建议通过互通网络或 overlay 解决。[云边部署文档](https://rlinf.readthedocs.io/en/latest/rst_source/guides/cloud_edge.html)
 
-**5. 推荐的接入架构**
+## 5. 推荐的接入架构
 
 ```mermaid
 flowchart TD
@@ -109,9 +113,9 @@ flowchart TD
 
 **路线 C：RLinf 同时负责策略训练及在线闭环。** 适合后续多机器人、多 GPU 或持续在线更新需求。需要额外的模型 backend、环境协议、推理服务器适配和 checkpoint 转换验证，工作量明显大于 A/B。建议先复现一个官方模拟环境配方，再接入录制回放环境，最后接真机任务。
 
-**6. 最先补齐的数据契约**
+## 6. 最先补齐的数据契约
 
-建议保留已有 LeRobot 标准字段，在新增的完整轨迹数据中约定下表。表中包含后续训练所需的目标字段，已实现的采集字段以 [RECAP 采集说明](../../src/lerobot/yzh/README_RECAP.md) 为准。
+建议保留已有 LeRobot 标准字段，在新增的完整轨迹数据中约定下表。表中包含后续训练所需的目标字段，已实现的采集字段以 [RECAP 采集说明](../architecture/recap.md) 为准。
 
 | 信息 | 推荐语义 |
 | --- | --- |
@@ -131,13 +135,13 @@ flowchart TD
 
 完整录制应从任务开始到任务结果确认持续工作，并保留控制来源切换。人工纠正后复位的当前行为，也要给出该任务本次尝试的明确结果；不能把“保存纠正窗口”直接解释为“任务成功”。程序复位动作不进入任务动作监督；操作者在停止录制前手动回 home 的动作仍会被记录，需要在任务定义或后续裁剪中明确其归属。
 
-根据实际采集流程，第一阶段已采用独立 `_recap` 入口，见 [采集说明](../../src/lerobot/yzh/README_RECAP.md)。只按明确的成功/失败保存，`/reset` 和退出丢弃未确认保存的本轮，不额外采集停止后的末帧。之前提议的 `unknown/aborted` 属于工程扩展，并非论文定义，现已取消；RECAP 的 Monte Carlo 回报需要已知任务结局，论文未明确要求保留无结局的中断前缀。[RECAP §IV-A、§V-C](https://arxiv.org/html/2511.14759v2)
+根据实际采集流程，第一阶段已采用独立 `_recap` 入口，见 [采集说明](../architecture/recap.md)。只按明确的成功/失败保存，`/reset` 和退出丢弃未确认保存的本轮，不额外采集停止后的末帧。之前提议的 `unknown/aborted` 属于工程扩展，并非论文定义，现已取消；RECAP 的 Monte Carlo 回报需要已知任务结局，论文未明确要求保留无结局的中断前缀。[RECAP §IV-A、§V-C](https://arxiv.org/html/2511.14759v2)
 
 **RTC 时间对齐是独立验收项。** 当前 30 Hz policy step 与插值后 60 Hz 下发是两个时间尺度。N-step 的 N、reward 的每步代价以及终止位置应基于同一时间尺度。必须保留原始目标、过滤后命令和实测状态的区别，不能用整个模型预测块替代实际轨迹；未被接纳、暂停后作废和未执行的动作都不能当作真实转移。
 
 原始数据应做成快照，标注写到附属表。例如 `meta/recap/<label_version>.parquet`，训练时严格按联合索引关联，不覆盖现有数据。RLinf 的回报脚本虽然把回报放在 sidecar，但仍更新 `meta/stats.json` 和 `meta/info.json`，所以也应对副本运行。[RLinf 回报脚本](https://github.com/RLinf/RLinf/blob/abdc6f8d52b830db5512bb95725927b20542cfb6/examples/offline_rl/advantage_labeling/recap/process/compute_returns.py)
 
-**7. 路线 A 的具体代码落点**
+## 7. 路线 A 的具体代码落点
 
 | 位置 | 建议改动 |
 | --- | --- |
@@ -158,7 +162,7 @@ flowchart TD
 
 保留现有 trained RTC 时，需要验证优势条件不会改变 action prefix 的归一化和坐标系；前缀仍应被固定，loss 仍只作用于后缀。后续使用双分支 CFG 时，两分支必须共享同一动作噪声及前缀约束，并重新测量 chunk 延迟和队列空转率。
 
-**8. 路线 B/C 接入 RLinf 必须解决的兼容问题**
+## 8. 路线 B/C 接入 RLinf 必须解决的兼容问题
 
 | 问题 | 源码事实 / 对本项目的影响 | 建议处理 |
 | --- | --- | --- |
@@ -173,7 +177,7 @@ flowchart TD
 | 推理 API | 当前 RLinf CFG `sample_actions` 没有本地 trained RTC 的 hard-prefix 接口 | 全栈接入需要新增 backend 适配；普通 checkpoint 加载成功不代表能替换现有 server |
 | 硬件连接所有权 | 两套驱动同时连接同一 Piper/CAN 会争用；本地另有主从影子控制 | 保持一个进程/服务负责设备所有权；RLinf 通过其协议访问，或整体切换设备所有者 |
 
-对应证据：[RECAP value loader](https://github.com/RLinf/RLinf/blob/abdc6f8d52b830db5512bb95725927b20542cfb6/rlinf/data/datasets/recap/value_dataset.py)、[优势字段加载](https://github.com/RLinf/RLinf/blob/abdc6f8d52b830db5512bb95725927b20542cfb6/rlinf/data/datasets/recap/cfg_model.py)、[CFG 模型及 sampler](https://github.com/RLinf/RLinf/blob/abdc6f8d52b830db5512bb95725927b20542cfb6/rlinf/models/embodiment/openpi_cfg/openpi_cfg_action_model.py)、[RLinf 依赖](https://github.com/RLinf/RLinf/blob/abdc6f8d52b830db5512bb95725927b20542cfb6/pyproject.toml)、[Evo-RL 依赖](https://github.com/MINT-SJTU/Evo-RL/blob/2b7d2e095a5de7e039691999a42b6276f7e0f6fb/pyproject.toml)、[本地夹爪单位](/home/cpy/桌面/yzh/piper/lerobot/src/lerobot/motors/piper/piper_PyAgxArm.py:28)。
+对应证据：[RECAP value loader](https://github.com/RLinf/RLinf/blob/abdc6f8d52b830db5512bb95725927b20542cfb6/rlinf/data/datasets/recap/value_dataset.py)、[优势字段加载](https://github.com/RLinf/RLinf/blob/abdc6f8d52b830db5512bb95725927b20542cfb6/rlinf/data/datasets/recap/cfg_model.py)、[CFG 模型及 sampler](https://github.com/RLinf/RLinf/blob/abdc6f8d52b830db5512bb95725927b20542cfb6/rlinf/models/embodiment/openpi_cfg/openpi_cfg_action_model.py)、[RLinf 依赖](https://github.com/RLinf/RLinf/blob/abdc6f8d52b830db5512bb95725927b20542cfb6/pyproject.toml)、[Evo-RL 依赖](https://github.com/MINT-SJTU/Evo-RL/blob/2b7d2e095a5de7e039691999a42b6276f7e0f6fb/pyproject.toml)、[本地夹爪单位](../../src/lerobot/motors/piper/piper_PyAgxArm.py#L28)。
 
 v3 跨文件问题是基于代码执行路径的条件性判断：是否会影响当前数据，需要检查实际 episode/shard 布局，不能仅凭版本号断言所有数据都会出错。
 
@@ -194,7 +198,7 @@ bash examples/offline_rl/policy_optimization/cfg_rl/run_cfg_rl.sh cfg_rl_openpi
 
 **路线 C 的环境设计建议**：新增一个针对本项目任务的 Gymnasium 环境或远程 bridge，以 `reset/step` 返回观测、reward、terminated、truncated、info，复用本地控制器维护接管、复位和超时状态。固定 `env` 位于机器人端，推理及训练位于 GPU 端，先单环境运行。跨回合切换模型版本时清空旧动作队列和请求 generation，避免同一个待执行 chunk 混入两个模型版本。若算法使用行为策略概率，人工干预和过期轨迹必须按该算法的离策略规则处理。
 
-**9. 分阶段交付与验收**
+## 9. 分阶段交付与验收
 
 | 阶段 | 交付 | 验收重点 |
 | --- | --- | --- |

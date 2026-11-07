@@ -15,7 +15,7 @@
 # limitations under the License.
 """Review every camera of a local LeRobot episode in one desktop window.
 
-Run ``python src/lerobot/yzh/lerobot_review_dataset.py`` and choose a dataset
+Run ``uv run --no-sync python -m lerobot.yzh.lerobot_review_dataset`` and choose a dataset
 folder in the CustomTkinter folder picker. Mark episodes for deletion, then
 save a filtered copy. The original dataset stays in place.
 """
@@ -46,8 +46,9 @@ from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 from lerobot.utils.constants import HF_LEROBOT_HOME
 
 SPEEDS = ("0.25×", "0.5×", "1×", "1.5×", "2×", "3×", "4×")
+PLAYBACK_MODES = ("播完暂停", "单集循环", "连续播放")
 TICK_MS = 33
-EPISODES_PER_MENU = 25  # Kept for compatibility with earlier callers; the selector is now a single menu.
+EPISODES_PER_PAGE = 10
 
 
 @dataclass(frozen=True)
@@ -319,7 +320,7 @@ def _configure_ctk_rendering() -> None:
 
 
 def _block_option_menu_mouse_events(option_menu: tk.Misc) -> None:
-    """Prevent wheel and secondary-click events from changing an episode."""
+    """Prevent wheel and secondary-click events from changing menu values."""
 
     def swallow_event(_event: tk.Event) -> str:
         return "break"
@@ -480,6 +481,8 @@ class ReviewPanel:
 
         self.dataset: LocalDataset | None = None
         self.current_episode: int | None = None
+        self.episode_page = 0
+        self.episode_buttons: dict[int, object] = {}
         self.deletions: set[int] = set()
         self.saved_deletions: set[int] = set()
         self.dirty = False
@@ -496,7 +499,10 @@ class ReviewPanel:
         self.resize_job: str | None = None
 
         self.dataset_var = tk.StringVar(value="未选择数据集 · 点击右上角“打开数据集”开始")
-        self.episode_var = tk.StringVar(value="—")
+        self.episode_var = tk.StringVar()
+        self.episode_range_var = tk.StringVar(value="/ —")
+        self.episode_page_var = tk.StringVar(value="0 / 0 页")
+        self.playback_mode_var = tk.StringVar(value="单集循环")
         self.speed_var = tk.StringVar(value="2×")
         self.time_var = tk.StringVar(value="00:00 / 00:00")
         self.review_var = tk.StringVar(value="尚未开始审查")
@@ -615,24 +621,39 @@ class ReviewPanel:
             corner_radius=14,
         )
         controls.grid(row=3, column=0, sticky="ew", padx=24, pady=(2, 8))
-        controls.grid_columnconfigure(1, weight=1)
+        controls.grid_columnconfigure(0, weight=1)
         episode_group = ctk.CTkFrame(controls, fg_color="transparent")
         episode_group.grid(row=0, column=0, sticky="w", padx=14, pady=12)
         ctk.CTkLabel(episode_group, text="Episode", font=self.font_latin).pack(side="left", padx=(0, 10))
-        self.episode_picker = ctk.CTkOptionMenu(
+        self.episode_entry = ctk.CTkEntry(
             episode_group,
-            values=["—"],
-            variable=self.episode_var,
-            command=self._episode_selected_value,
-            width=112,
+            textvariable=self.episode_var,
+            width=70,
             height=34,
             corner_radius=9,
             state="disabled",
             font=self.font_latin,
-            dropdown_font=self.font_latin,
+            justify="center",
         )
-        self.episode_picker.pack(side="left", padx=(0, 8))
-        _block_option_menu_mouse_events(self.episode_picker)
+        self.episode_entry.pack(side="left")
+        self.episode_entry.bind("<Return>", self._jump_episode)
+        ctk.CTkLabel(
+            episode_group,
+            textvariable=self.episode_range_var,
+            font=self.font_latin,
+            text_color=UI_COLORS["muted"],
+        ).pack(side="left", padx=(6, 12))
+        self.jump_button = ctk.CTkButton(
+            episode_group,
+            text="跳转",
+            command=self._jump_episode,
+            width=60,
+            height=34,
+            corner_radius=9,
+            font=self.font_body,
+            state="disabled",
+        )
+        self.jump_button.pack(side="left", padx=(0, 8))
         self.previous_button = ctk.CTkButton(
             episode_group,
             text="上一集",
@@ -661,7 +682,7 @@ class ReviewPanel:
         self.next_button.pack(side="left", padx=3)
 
         playback_group = ctk.CTkFrame(controls, fg_color="transparent")
-        playback_group.grid(row=0, column=1, sticky="w", padx=12, pady=12)
+        playback_group.grid(row=0, column=1, sticky="e", padx=14, pady=12)
         self.play_button = ctk.CTkButton(
             playback_group,
             text="播放",
@@ -690,17 +711,48 @@ class ReviewPanel:
         self.speed_menu.pack(side="left")
         _block_option_menu_mouse_events(self.speed_menu)
 
-        self.review_badge = ctk.CTkLabel(
+        episode_strip = ctk.CTkFrame(controls, fg_color="transparent")
+        episode_strip.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 12))
+        episode_strip.grid_columnconfigure(0, weight=1)
+        self.episode_buttons_frame = ctk.CTkFrame(episode_strip, fg_color="transparent")
+        self.episode_buttons_frame.grid(row=0, column=0, sticky="ew")
+        for column in range(EPISODES_PER_PAGE):
+            self.episode_buttons_frame.grid_columnconfigure(column, weight=1, uniform="episode")
+        page_group = ctk.CTkFrame(episode_strip, fg_color="transparent")
+        page_group.grid(row=0, column=1, padx=(12, 0))
+        self.previous_page_button = ctk.CTkButton(
+            page_group,
+            text="‹",
+            command=lambda: self._move_episode_page(-1),
+            width=32,
+            height=30,
+            font=self.font_latin,
+            state="disabled",
+        )
+        self.previous_page_button.pack(side="left")
+        ctk.CTkLabel(page_group, textvariable=self.episode_page_var, font=self.font_small, width=80).pack(
+            side="left", padx=4
+        )
+        self.next_page_button = ctk.CTkButton(
+            page_group,
+            text="›",
+            command=lambda: self._move_episode_page(1),
+            width=32,
+            height=30,
+            font=self.font_latin,
+            state="disabled",
+        )
+        self.next_page_button.pack(side="left")
+
+        self.playback_modes = ctk.CTkSegmentedButton(
             controls,
-            textvariable=self.review_var,
-            width=210,
+            values=list(PLAYBACK_MODES),
+            variable=self.playback_mode_var,
+            command=self._playback_mode_changed,
             height=32,
-            corner_radius=10,
-            fg_color=UI_COLORS["surface_alt"],
-            text_color=UI_COLORS["muted"],
             font=self.font_small,
         )
-        self.review_badge.grid(row=0, column=2, sticky="e", padx=14, pady=12)
+        self.playback_modes.grid(row=1, column=1, sticky="e", padx=14, pady=(0, 12))
 
         decisions = ctk.CTkFrame(self.root, fg_color="transparent")
         decisions.grid(row=4, column=0, sticky="ew", padx=24, pady=(0, 8))
@@ -763,6 +815,17 @@ class ReviewPanel:
             text_color=UI_COLORS["muted"],
             anchor="w",
         ).grid(row=0, column=0, sticky="w")
+        self.review_badge = ctk.CTkLabel(
+            deleted_header,
+            textvariable=self.review_var,
+            width=210,
+            height=28,
+            corner_radius=8,
+            fg_color=UI_COLORS["surface_alt"],
+            text_color=UI_COLORS["muted"],
+            font=self.font_small,
+        )
+        self.review_badge.grid(row=0, column=1, sticky="e", padx=(12, 0))
         self.deleted_list = ctk.CTkScrollableFrame(
             self.deleted_card,
             orientation="horizontal",
@@ -830,6 +893,7 @@ class ReviewPanel:
         )
         self.busy_progress.grid(row=0, column=1, padx=(14, 0))
         self.busy_progress.grid_remove()
+        self._update_action_state()
 
     def _show_video_placeholder(self) -> None:
         for child in self.video_row.winfo_children():
@@ -866,9 +930,25 @@ class ReviewPanel:
     def _update_action_state(self) -> None:
         has_episode = self.dataset is not None and self.current_episode is not None
         episode_state = "normal" if self.dataset is not None and not self.busy else "disabled"
-        self.episode_picker.configure(state=episode_state)
+        self.episode_entry.configure(state=episode_state)
+        self.jump_button.configure(state=episode_state)
+        for button in self.episode_buttons.values():
+            button.configure(state=episode_state)
+        total = self.dataset.meta.total_episodes if self.dataset is not None else 0
+        self.previous_page_button.configure(
+            state="normal" if self.episode_page > 0 and not self.busy else "disabled"
+        )
+        self.next_page_button.configure(
+            state="normal"
+            if (self.episode_page + 1) * EPISODES_PER_PAGE < total and not self.busy
+            else "disabled"
+        )
         self.previous_button.configure(state="normal" if has_episode and not self.busy else "disabled")
         self.next_button.configure(state="normal" if has_episode and not self.busy else "disabled")
+        playback_state = "normal" if self.decoders and not self.busy else "disabled"
+        self.play_button.configure(state=playback_state)
+        self.timeline.configure(state=playback_state)
+        self.playback_modes.configure(state="disabled" if self.busy else "normal")
         review_state = "normal" if has_episode and not self.busy else "disabled"
         self.keep_button.configure(state=review_state)
         self.delete_button.configure(state=review_state)
@@ -1086,6 +1166,9 @@ class ReviewPanel:
         self._close_decoders()
         self.dataset = dataset
         self.current_episode = None
+        self.episode_page = 0
+        self.episode_var.set("")
+        self.episode_range_var.set(f"/ {dataset.meta.total_episodes - 1}")
         self.deletions.clear()
         self.saved_deletions.clear()
         self.dirty = False
@@ -1095,8 +1178,8 @@ class ReviewPanel:
         )
         self.output_var.set(str(default_output_path(dataset.root)))
         self._build_camera_panels()
-        self._build_episode_menu()
-        self._set_busy(False, "点击 Episode 下拉菜单切换；标记删除后点击“生成过滤数据集”。")
+        self._build_episode_buttons()
+        self._set_busy(False, "点击编号或输入编号后回车切换 Episode；下方可切换循环或连续播放。")
         self.load_episode(0)
 
     def _build_camera_panels(self) -> None:
@@ -1147,15 +1230,54 @@ class ReviewPanel:
         if not self.playing:
             self._render()
 
-    def _build_episode_menu(self) -> None:
+    def _build_episode_buttons(self) -> None:
+        """Show one page of numbered buttons, highlighting the current and deleted episodes."""
+        for child in self.episode_buttons_frame.winfo_children():
+            child.destroy()
+        self.episode_buttons.clear()
         if self.dataset is None:
-            self.episode_picker.configure(values=["—"], state="disabled")
-            self.episode_var.set("—")
+            self.episode_page_var.set("0 / 0 页")
             return
-        values = [str(index) for index in range(self.dataset.meta.total_episodes)]
-        self.episode_picker.configure(values=values, state="normal" if not self.busy else "disabled")
-        if self.current_episode is not None:
-            self.episode_var.set(str(self.current_episode))
+        total = self.dataset.meta.total_episodes
+        pages = (total + EPISODES_PER_PAGE - 1) // EPISODES_PER_PAGE
+        self.episode_page = min(max(self.episode_page, 0), pages - 1)
+        self.episode_page_var.set(f"{self.episode_page + 1} / {pages} 页")
+        start = self.episode_page * EPISODES_PER_PAGE
+        for column, index in enumerate(range(start, min(start + EPISODES_PER_PAGE, total))):
+            selected = index == self.current_episode
+            marked = index in self.deletions
+            fg_color = UI_COLORS["accent"] if selected else UI_COLORS["surface_alt"]
+            hover_color = UI_COLORS["accent_hover"] if selected else UI_COLORS["border"]
+            text_color = "#ffffff" if selected else UI_COLORS["muted"]
+            if marked:
+                fg_color = UI_COLORS["danger"] if selected else ("#fee2e2", "#451a1a")
+                hover_color = UI_COLORS["danger_hover"] if selected else ("#fecaca", "#7f1d1d")
+                text_color = "#ffffff" if selected else ("#b91c1c", "#fca5a5")
+            button = ctk.CTkButton(
+                self.episode_buttons_frame,
+                text=str(index),
+                command=lambda episode=index: self.load_episode(episode),
+                width=36,
+                height=30,
+                corner_radius=8,
+                font=self.font_latin,
+                fg_color=fg_color,
+                hover_color=hover_color,
+                text_color=text_color,
+                border_width=2 if selected else 0,
+                border_color=UI_COLORS["accent"],
+                state="disabled" if self.busy else "normal",
+            )
+            button.grid(row=0, column=column, sticky="ew", padx=3)
+            self.episode_buttons[index] = button
+
+    def _move_episode_page(self, direction: int) -> None:
+        """Browse episode numbers without interrupting the current video."""
+        if self.busy or self.dataset is None:
+            return
+        self.episode_page += direction
+        self._build_episode_buttons()
+        self._update_action_state()
 
     def _close_decoders(self) -> None:
         self.playing = False
@@ -1171,6 +1293,8 @@ class ReviewPanel:
         if not 0 <= index < self.dataset.meta.total_episodes:
             return
         self._close_decoders()
+        self.scrubbing = False
+        self.resume_after_scrub = False
         opened: dict[str, EpisodeVideoDecoder] = {}
         try:
             durations = []
@@ -1185,17 +1309,20 @@ class ReviewPanel:
             self.timeline.configure(to=self.duration_s, state="normal")
             self.timeline.set(0.0)
             self.episode_var.set(str(index))
-            self._build_episode_menu()
+            self.episode_page = index // EPISODES_PER_PAGE
+            self._build_episode_buttons()
             self._update_review_status()
             self._update_action_state()
-            self._render()
             self.playing = True
+            self._render()
             self.last_tick = time.monotonic()
-            self.play_button.configure(text="暂停")
+            self.play_button.configure(text="暂停" if self.playing else "播放")
         except Exception as exc:
+            self.playing = False
             for decoder in opened.values():
                 decoder.close()
             self.decoders.clear()
+            self._update_action_state()
             self.play_button.configure(text="播放")
             self.status_var.set(f"Episode {index} 加载失败。")
             self._show_message("视频加载失败", str(exc), "error")
@@ -1242,18 +1369,49 @@ class ReviewPanel:
                 text_color=("#b91c1c", "#fca5a5"),
             ).grid(row=0, column=column, padx=4, pady=7)
 
-    def _episode_selected_value(self, value: str) -> None:
-        if value.isdecimal():
-            self.load_episode(int(value))
-
-    def _episode_selected(self, event=None) -> None:
-        self._episode_selected_value(self.episode_var.get())
+    def _jump_episode(self, event=None) -> str:
+        """Load an explicitly submitted episode number, leaving invalid input editable."""
+        if self.busy or self.dataset is None:
+            return "break"
+        try:
+            index = int(self.episode_var.get().strip())
+        except ValueError:
+            index = -1
+        if not 0 <= index < self.dataset.meta.total_episodes:
+            self.status_var.set(f"请输入 0 到 {self.dataset.meta.total_episodes - 1} 之间的 Episode 编号。")
+            self.episode_entry.focus_set()
+            self.episode_entry.select_range(0, tk.END)
+            return "break"
+        self.load_episode(index)
+        return "break"
 
     def _move_episode(self, direction: int) -> None:
         if self.dataset is None or self.current_episode is None:
             return
         index = (self.current_episode + direction) % self.dataset.meta.total_episodes
         self.load_episode(index)
+
+    def _playback_mode_changed(self, mode: str) -> None:
+        descriptions = {
+            "播完暂停": "当前 Episode 播完后暂停。",
+            "单集循环": "当前 Episode 播完后自动从头播放。",
+            "连续播放": "播完自动播放下一集；最后一集播完后回到第 0 集。",
+        }
+        self.status_var.set(descriptions[mode])
+
+    def _finish_episode(self) -> None:
+        """Apply the selected playback mode after the final frame is rendered."""
+        if not self.playing or self.busy or not self.decoders or self.dataset is None:
+            return
+        mode = self.playback_mode_var.get()
+        if mode == "连续播放" and self.dataset.meta.total_episodes > 1:
+            self._move_episode(1)
+        elif mode in {"单集循环", "连续播放"}:
+            self.seek_to(0.0)
+            self.last_tick = time.monotonic()
+        else:
+            self.playing = False
+            self.play_button.configure(text="播放")
 
     def toggle_play(self) -> None:
         """Pause playback or resume it from the current timeline position."""
@@ -1266,7 +1424,7 @@ class ReviewPanel:
         self.play_button.configure(text="暂停" if self.playing else "播放")
 
     def _begin_scrub(self, event=None) -> None:
-        if not self.decoders:
+        if not self.decoders or self.busy:
             return
         self.scrubbing = True
         self.resume_after_scrub = self.playing
@@ -1328,15 +1486,15 @@ class ReviewPanel:
 
     def _tick(self) -> None:
         now = time.monotonic()
-        if self.playing and self.decoders and not self.scrubbing:
+        elapsed = now - self.last_tick
+        self.last_tick = now
+        if self.playing and self.decoders and not self.scrubbing and not self.busy:
             speed = float(self.speed_var.get().removesuffix("×"))
-            self.position_s = min(self.duration_s, self.position_s + (now - self.last_tick) * speed)
+            self.position_s = min(self.duration_s, self.position_s + elapsed * speed)
             self.timeline.set(self.position_s)
             self._render()
-            if self.position_s >= self.duration_s:
-                self.playing = False
-                self.play_button.configure(text="播放")
-        self.last_tick = now
+            if self.playing and self.position_s >= self.duration_s:
+                self._finish_episode()
         self.root.after(TICK_MS, self._tick)
 
     def mark_current(self, delete: bool) -> None:
@@ -1355,6 +1513,7 @@ class ReviewPanel:
         else:
             self.status_var.set(f"Episode {self.current_episode} 已保留。")
         self.dirty = self.deletions != self.saved_deletions
+        self._build_episode_buttons()
         self._update_review_status()
         self._update_action_state()
 
@@ -1537,13 +1696,19 @@ class ReviewPanel:
 def main() -> None:
     """Start the CustomTkinter review panel."""
     if ctk is None:
-        raise SystemExit("此面板需要 CustomTkinter，请先安装：python -m pip install customtkinter")
+        raise SystemExit(
+            "此面板需要 CustomTkinter。请在项目根目录执行：\n"
+            "  uv sync --locked --inexact --extra desktop --extra dataset\n"
+            "同步时保留 dataset 及本机其他所需 extra，再通过 uv run --no-sync 运行对应命令。\n"
+            f"当前解释器：{sys.executable}"
+        )
     if _tk_xft_status() is False:
         raise SystemExit(
             "当前 Python 使用的是不支持 Xft/FreeType 的 Tk，文字会被渲染成位图。\n"
-            "请在当前环境执行：\n"
-            "  conda install -n lerobot --override-channels -c conda-forge 'tk=*=xft_*'\n"
-            "然后重新启动本程序。"
+            "请通过 uv run --no-sync 使用项目 Python 环境；若仍出现此错误，需修复该解释器的 Tk。\n"
+            "Python 桌面依赖统一由 uv sync --locked --inexact --extra desktop --extra dataset 管理，"
+            "同步时保留 dataset 及本机其他所需 extra；desktop extra 不会替换解释器自带的 Tk。\n"
+            f"当前解释器：{sys.executable}"
         )
     _configure_ctk_rendering()
     ctk.set_appearance_mode("dark")

@@ -13,10 +13,12 @@ from collections import defaultdict, deque
 from dataclasses import replace
 from datetime import datetime
 from html import escape
+from pathlib import Path
 from time import monotonic
 from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
+from PyQt5 import QtCore
 from PyQt5.QtCore import (
     QEvent,
     QEasingCurve,
@@ -83,7 +85,6 @@ DISK_TEXT_LAYOUT = (45, 63)
 TRAINING_CAROUSEL_INTERVAL = 4000
 TRAINING_TRANSITION_DURATION = 480
 BALL_AVAILABILITY_PAGE = 2
-BALL_UNMATCHED_TASK_PAGE = 3
 BALL_DISK_PAGE = 4
 BALL_SUMMARY_PAGE = 5
 BALL_SSH_LOGIN_PAGE = 6
@@ -125,26 +126,6 @@ def _ball_training_percent(progress: remote.TrainingProgress | None) -> str:
         return "<0.1%"
     # Keep an unfinished job below 100%, even near the rounding boundary.
     return f"{tenths // 10}.{tenths % 10}%"
-
-
-def _rounded_rectangle(canvas: PillowCanvas, *coordinates: float, **kwargs: Any) -> int:
-    return canvas.rounded_rectangle(*coordinates, **kwargs)
-
-
-def _level_color(value: float, *, memory: bool = False) -> str:
-    return core._level_color(value, memory=memory)
-
-
-def _compact_memory(gib: float) -> str:
-    return core._compact_memory(gib)
-
-
-def _clamp_percent(value: float | None) -> float:
-    return core._clamp_percent(value)
-
-
-def user_color(username: str) -> str:
-    return core.user_color(username)
 
 
 def _request_badges(notice: core.Announcement) -> tuple[str, str]:
@@ -1669,7 +1650,7 @@ class MonitorWindow(QWidget):
             )
             lines.append(
                 f"{HIGHLIGHT_USERNAME}：GPU {indexes(self.own_gpu_indexes)} · "
-                f"显存合计 {_compact_memory(own_memory)}"
+                f"显存合计 {core._compact_memory(own_memory)}"
                 if self.own_gpu_indexes
                 else f"{HIGHLIGHT_USERNAME}：未使用 GPU"
             )
@@ -1915,8 +1896,8 @@ class MonitorWindow(QWidget):
         fill = (
             COLORS["button_hover"] if self.hovered_button == name else COLORS["panel"]
         )
-        _rounded_rectangle(
-            self.canvas, x, y, x + size, y + size, 8, fill=fill, outline=""
+        self.canvas.rounded_rectangle(
+            x, y, x + size, y + size, 8, fill=fill, outline=""
         )
         color = COLORS["blue"] if name == "pin" and self.topmost else COLORS["muted"]
         if name == "compact":
@@ -1924,8 +1905,7 @@ class MonitorWindow(QWidget):
                 x + 9, y + 9, x + 21, y + 21, fill=color, outline=""
             )
         elif name == "corners":
-            _rounded_rectangle(
-                self.canvas,
+            self.canvas.rounded_rectangle(
                 x + 8,
                 y + 8,
                 x + 22,
@@ -1954,13 +1934,12 @@ class MonitorWindow(QWidget):
         color: str,
     ) -> None:
         height = 7
-        _rounded_rectangle(
-            self.canvas, x1, y1, x2, y1 + height, 4, fill=COLORS["track"], outline=""
+        self.canvas.rounded_rectangle(
+            x1, y1, x2, y1 + height, 4, fill=COLORS["track"], outline=""
         )
-        fill_width = (x2 - x1) * _clamp_percent(value) / 100
+        fill_width = (x2 - x1) * core._clamp_percent(value) / 100
         if fill_width >= 2:
-            _rounded_rectangle(
-                self.canvas,
+            self.canvas.rounded_rectangle(
                 x1,
                 y1,
                 x1 + fill_width,
@@ -2175,8 +2154,7 @@ class MonitorWindow(QWidget):
         height = 15
         if metric.has_user(HIGHLIGHT_USERNAME):
             self.memory_bar_boxes[metric.index] = (x1, y1, x2, y1 + height)
-        _rounded_rectangle(
-            self.canvas,
+        self.canvas.rounded_rectangle(
             x1,
             y1,
             x2,
@@ -2199,10 +2177,9 @@ class MonitorWindow(QWidget):
             )
             segment_width = max(track_width * 0.004, proportional_width)
             segment_end = min(x2, cursor + segment_width)
-            color = user_color(usage.username)
+            color = core.user_color(usage.username)
             if cursor == x1:
-                _rounded_rectangle(
-                    self.canvas,
+                self.canvas.rounded_rectangle(
                     cursor,
                     y1,
                     segment_end,
@@ -2262,7 +2239,7 @@ class MonitorWindow(QWidget):
 
         prefix = f"{metric.process_count} 进程"
         usage_parts = [
-            f"{usage.username} {_compact_memory(usage.memory_gib)}"
+            f"{usage.username} {core._compact_memory(usage.memory_gib)}"
             for usage in metric.user_usages
         ]
         full_text = " · ".join((prefix, *usage_parts))
@@ -2346,7 +2323,10 @@ class MonitorWindow(QWidget):
         points: list[float] = []
         for offset, value in enumerate(values):
             points.extend(
-                (start_x + offset * step, y2 - _clamp_percent(value) / 100 * (y2 - y1))
+                (
+                    start_x + offset * step,
+                    y2 - core._clamp_percent(value) / 100 * (y2 - y1),
+                )
             )
         self.canvas.create_line(
             *points, fill=color, width=1.5, smooth=True, splinesteps=12
@@ -2367,8 +2347,7 @@ class MonitorWindow(QWidget):
         highlighted = metric is not None and metric.has_user(HIGHLIGHT_USERNAME)
         reserved = index in self.reserved_gpu_indexes
         conflict = reserved and highlighted
-        _rounded_rectangle(
-            self.canvas,
+        self.canvas.rounded_rectangle(
             x,
             y,
             x + width,
@@ -2387,8 +2366,7 @@ class MonitorWindow(QWidget):
             width=2.5 if highlighted or reserved else 1,
         )
         if conflict:
-            _rounded_rectangle(
-                self.canvas,
+            self.canvas.rounded_rectangle(
                 x + 4,
                 y + 4,
                 x + width - 4,
@@ -2414,8 +2392,8 @@ class MonitorWindow(QWidget):
             self._draw_progress(x + 15, y + 98, x + width - 15, 0, COLORS["green"])
             return
 
-        util_color = _level_color(metric.utilization)
-        memory_color = _level_color(metric.memory_percent, memory=True)
+        util_color = core._level_color(metric.utilization)
+        memory_color = core._level_color(metric.memory_percent, memory=True)
         self.canvas.create_oval(
             x + 15, y + 14, x + 22, y + 21, fill=util_color, outline=""
         )
@@ -2500,8 +2478,7 @@ class MonitorWindow(QWidget):
 
     def _draw_notices(self, width: int) -> None:
         self.notice_box = (18, 74, width - 18, 136)
-        _rounded_rectangle(
-            self.canvas,
+        self.canvas.rounded_rectangle(
             *self.notice_box,
             10,
             fill="#111C2B",
@@ -2576,8 +2553,7 @@ class MonitorWindow(QWidget):
                 (deadline, COLORS["amber"], "#302519"),
             ):
                 badge_width = self.canvas.measure_text(label, badge_font)[0] + 14
-                _rounded_rectangle(
-                    self.canvas,
+                self.canvas.rounded_rectangle(
                     x,
                     NOTICE_ROW_Y - 9 + offset,
                     x + badge_width,
@@ -2652,8 +2628,7 @@ class MonitorWindow(QWidget):
             if self.rounded_frame and not self.args.windowed and not self.isMaximized()
             else 0
         )
-        _rounded_rectangle(
-            self.canvas,
+        self.canvas.rounded_rectangle(
             0,
             0,
             width - 1,
@@ -2718,8 +2693,7 @@ class MonitorWindow(QWidget):
         status_font = (self.family, 9)
         pill_width = self.canvas.measure_text(self.status_message, status_font)[0] + 40
         pill_x = width - 241 - pill_width
-        _rounded_rectangle(
-            self.canvas,
+        self.canvas.rounded_rectangle(
             pill_x,
             18,
             pill_x + pill_width,
@@ -2824,7 +2798,7 @@ class MonitorWindow(QWidget):
             return
         fresh = sample.is_fresh(self.training_config.stale_after)
         color = remote.TRAINING_COLORS[index] if fresh else COLORS["subtle"]
-        percent = _clamp_percent(sample.progress.percent)
+        percent = core._clamp_percent(sample.progress.percent)
         end = -90 + 3.6 * percent
         self.canvas.create_arc(
             x1, y1, x2, y2, start=-90, end=end, fill=color, width=width
@@ -3104,11 +3078,6 @@ class MonitorWindow(QWidget):
                 ),
                 COLORS["cyan"] if known else COLORS["muted"],
             )
-        if page == BALL_UNMATCHED_TASK_PAGE:
-            return (
-                ("…", f"GPU {next(iter(self.own_gpu_indexes))}", "待匹配日志"),
-                COLORS["subtle"],
-            )
         sample = (
             self.training_samples[page]
             if self.training_config and page < len(self.training_samples)
@@ -3152,7 +3121,6 @@ class MonitorWindow(QWidget):
             BALL_SSH_LOGIN_PAGE,
             BALL_AVAILABILITY_PAGE,
             BALL_SUMMARY_PAGE,
-            BALL_UNMATCHED_TASK_PAGE,
         ):
             # CJK headings have taller glyphs than numerical percentages.
             # Separate rows and a smaller heading avoid ink overlap even at
@@ -3298,6 +3266,17 @@ class MonitorWindow(QWidget):
         self.update()
 
 
+def _configure_qt_plugin_paths() -> None:
+    # QLibraryInfo can lose non-ASCII characters in the wheel's install path.
+    # Resolve plugins beside the loaded binding, keeping system Qt's discovery
+    # unchanged when that installation does not include a bundled Qt5 tree.
+    plugins = Path(QtCore.__file__).resolve().parent / "Qt5" / "plugins"
+    platforms = plugins / "platforms"
+    if platforms.is_dir():
+        os.environ["QT_PLUGIN_PATH"] = str(plugins)
+        os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = str(platforms)
+
+
 def run_desktop(args: argparse.Namespace) -> int:
     if sys.platform.startswith("linux") and not (
         os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
@@ -3307,6 +3286,7 @@ def run_desktop(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    _configure_qt_plugin_paths()
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps)
     app = QApplication([sys.argv[0]])

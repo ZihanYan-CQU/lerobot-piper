@@ -1540,6 +1540,26 @@ class PI05Policy(PreTrainedPolicy):
         return actions
 
     @torch.no_grad()
+    def predict_action_chunk_with_rlt_features(
+        self, batch: dict[str, Tensor], *, noise=None, num_steps=None, **rtc_kwargs,
+    ):
+        """Return (normalized reference chunk, z_rl) sharing a single VLM prefix pass.
+
+        Stage 2 and RTC use the same boundary observation for features/reference.
+        Use the saved preprocessor first; optional guided RTC kwargs condition the suffix.
+        """
+        if not self.config.use_rlt or self.config.backend != "rlinf":
+            raise ValueError("Shared RLT sampling requires backend='rlinf' and use_rlt=True")
+        self.eval()
+        images, img_masks = self._preprocess_images(batch)
+        actions, z = self.model.sample_actions_with_rlt_features(
+            images, img_masks, batch[OBS_LANGUAGE_TOKENS], batch[OBS_LANGUAGE_ATTENTION_MASK],
+            noise=noise, num_steps=num_steps, **rtc_kwargs,
+        )
+        dim = self.config.output_features[ACTION].shape[0]
+        return actions[:, :, :dim], z
+
+    @torch.no_grad()
     def extract_rlt_features(self, batch: dict[str, Tensor]) -> Tensor:
         """Encode a preprocessed LeRobot observation into a (batch, rlt_embed_dim) vector.
 

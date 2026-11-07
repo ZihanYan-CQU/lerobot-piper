@@ -18,8 +18,7 @@ This module intentionally does not change the generic Piper robot or teleoperato
 classes.  It implements the dynamic handover recommended by Piper's official
 human-in-the-loop note:
 
-* autonomous: both arms receive the same position targets; the follower can use
-  its optional explicit MIT gain backend, while the master keeps ``move_js``;
+* autonomous: both arms are followers and receive the same ``move_js`` targets;
 * correction: computer commands stop, the master becomes a leader, and physical
   control frames (0x151--0x159) are bridged from ``can_master`` to ``can_follower``;
 * resume: the bridge stops first, the master returns to follower mode, a fresh
@@ -915,26 +914,18 @@ class PiperDaggerController:
         self._ema_command[6] = gripper_alpha * target[6] + (1.0 - gripper_alpha) * self._ema_command[6]
         return list(self._ema_command)
 
-    def _write_same_values(self, values: list[float], *, use_follower_gains: bool = False) -> None:
-        # Only autonomous policy commands use the experimental follower backend.
-        # Native holds establish the existing JS handover/bridge mode.
-        tuned = use_follower_gains and getattr(
-            self.follower_robot.config, "joint_control_mode", "native"
-        ) == "mit"
-        follower_write = (
-            self.follower_robot.write_joint_command if tuned else self.follower_bus.write_js
-        )
+    def _write_same_values(self, values: list[float]) -> None:
         if self.config.debug_command_timing:
             started = time.monotonic()
         if self.config.follower_first:
-            follower_write(values)
+            self.follower_bus.write_js(values)
             self.master_bus.write_js(values)
         else:
             self.master_bus.write_js(values)
-            follower_write(values)
+            self.follower_bus.write_js(values)
         if self.config.debug_command_timing:
             skew_ms = (time.monotonic() - started) * 1000
-            logger.debug("Piper dual-arm MIT command dispatched (sequential span %.3f ms)", skew_ms)
+            logger.debug("Piper dual-arm JS command dispatched (sequential span %.3f ms)", skew_ms)
 
     def _write_same_unfiltered(self, action: dict[str, float]) -> dict[str, float]:
         values = self._action_values(action)
@@ -942,13 +933,36 @@ class PiperDaggerController:
         return self._action_dict(values)
 
     def send_same_action(self, action: dict[str, float]) -> dict[str, float]:
-        """Apply one shared EMA result and send exactly that vector to both arms."""
+        """Apply one shared EMA result and send the same JS targets to both arms."""
 
         with self._lock:
             if self._closed or self._mode in (PiperControlMode.CORRECTING, PiperControlMode.CLOSED):
                 raise PiperDaggerHardwareError(f"computer command rejected in mode {self._mode.value}")
             values = self._smooth(self._action_values(action))
-            self._write_same_values(values, use_follower_gains=self._mode is PiperControlMode.SHADOW)
+            self._write_same_values(values)
+            return self._action_dict(values)
+
+    def send_planned_action(self, action: dict[str, float]) -> dict[str, float]:
+        """Send reset waypoints through J mode on both arms, without shared EMA."""
+        with self._lock:
+            if self._closed or self._mode in (PiperControlMode.CORRECTING, PiperControlMode.CLOSED):
+                raise PiperDaggerHardwareError(f"planned command rejected in mode {self._mode.value}")
+            values = self._action_values(action)
+
+            def write_follower():
+                planned = getattr(self.follower_robot, "send_action_planned", None)
+                if callable(planned):
+                    planned(self._action_dict(values))
+                else:
+                    self.follower_bus.write(values)
+
+            if self.config.follower_first:
+                write_follower()
+                self.master_bus.write(values)
+            else:
+                self.master_bus.write(values)
+                write_follower()
+            self.seed_command(self._action_dict(values))
             return self._action_dict(values)
 
     def pause_computer_output(self) -> None:
@@ -1149,6 +1163,9 @@ class PiperDaggerRobotProxy:
 
     def send_action(self, action: dict[str, float]) -> dict[str, float]:
         return self._controller.send_same_action(action)
+
+    def send_action_planned(self, action: dict[str, float]) -> dict[str, float]:
+        return self._controller.send_planned_action(action)
 
     def seed_command(self, pose: dict[str, float]) -> None:
         self._controller.seed_command(pose)

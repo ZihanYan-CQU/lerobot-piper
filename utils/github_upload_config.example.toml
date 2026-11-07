@@ -1,0 +1,32 @@
+# GitHub 上传参数（本机私有文件，请放在项目目录之外）
+# 修改后重新启动窗口，或点击「重新读取」。
+
+# 本地项目根目录；留空则使用工具所在项目
+directory = "/path/to/project"
+
+# 个人 GitHub 仓库地址，例如 https://github.com/用户名/仓库.git
+remote = "https://github.com/用户名/仓库.git"
+
+# 上传到 GitHub 的目标分支
+branch = "main"
+
+# 默认提交说明，上传时仍可在窗口修改
+message = "Update local code"
+
+# GitHub 登录用户名；使用 HTTPS Token 时传给 Git
+username = "你的GitHub用户名"
+
+# Git 提交者姓名；留空时读取项目的 Git 配置
+name = ""
+
+# Git 提交者邮箱；留空时读取项目的 Git 配置
+email = "your-email@example.com"
+
+# 填写自己的有效 Token；留空则使用已有 Git / SSH 凭据
+token = ""
+
+# true：仅上传当前代码，跳过旧历史与 LFS 资源
+code_only = true
+
+# 缺少 .gitignore 时创建基础忽略规则
+create_ignore = true

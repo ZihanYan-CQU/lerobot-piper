@@ -52,13 +52,6 @@ COLOR_MAP = {
     "reset": "\033[0m",
 }
 
-def move_cursor_up(lines):
-    """Move the cursor up by a specified number of lines."""
-    print(f"\033[{lines}A", end="")
-
-def move_cursor_down(lines):
-    """Move the cursor down by a specified number of lines."""
-    print(f"\033[{lines}B", end="")
 
 def inside_slurm():
     """Check whether the python process was launched through slurm"""
@@ -261,7 +254,7 @@ def enter_pressed() -> bool:
         return select.select([sys.stdin], [], [], 0)[0] and sys.stdin.readline().strip() == ""
 
 
-def move_cursor_up(lines):
+def move_cursor_up(lines: int) -> None:
     """Move the cursor up by a specified number of lines."""
     print(f"\033[{lines}A", end="")
 

@@ -1,56 +1,81 @@
 #!/usr/bin/env bash
-# Reuse an available GUI environment, or prepare an isolated one without training dependencies.
+# Launch the upload window directly through uv and the existing project environment.
 set -euo pipefail
+unset PYTHONHOME PYTHONPATH LD_LIBRARY_PATH LD_PRELOAD
+# Retired interpreter overrides must not bypass the uv project environment.
+unset GITHUB_UPLOAD_PYTHON
+export PYTHONNOUSERSITE=1
 
-script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 project_dir="$(dirname -- "$script_dir")"
-env_dir="$project_dir/.cache/github-upload-venv"
-env_python="$env_dir/bin/python"
+project_python="$project_dir/.venv/bin/python"
 
-# The existing LeRobot environment may already provide the same GUI dependencies as the yzh tools.
-candidates=(
-    "${GITHUB_UPLOAD_PYTHON:-}"
-    "$env_python"
-    "$project_dir/.venv/bin/python"
-    "$HOME/anaconda3/envs/lerobot/bin/python"
-    "$HOME/miniconda3/envs/lerobot/bin/python"
-    /usr/bin/python3
-    "$(command -v python3)"
-)
-base_python=""
-for candidate in "${candidates[@]}"; do
-    [[ -x "$candidate" ]] || continue
-    if "$candidate" -c 'import tkinter, customtkinter; from PIL import Image' 2>/dev/null; then
-        exec "$candidate" "$script_dir/github_upload_gui.py" "$@"
+dependency_help() {
+    printf '%s\n' \
+        'GitHub 上传界面需要项目 desktop extra 中的 PyQt5。' \
+        '请在项目根目录执行：uv sync --locked --inexact --extra desktop' \
+        '同步时同时保留本机其他所需 extra；本启动器不会自动安装依赖。' >&2
+}
+
+if [[ ! -x "$project_python" ]]; then
+    printf '项目环境不存在：%s\n' "$project_python" >&2
+    dependency_help
+    exit 1
+fi
+uv_bin="${PIPER_UV:-}"
+if [[ -z "$uv_bin" ]]; then
+    if [[ -x "$HOME/.local/bin/uv" ]]; then
+        uv_bin="$HOME/.local/bin/uv"
+    else
+        uv_bin="$(command -v uv || true)"
     fi
-    if [[ -z "$base_python" ]] && "$candidate" -c 'import tkinter' 2>/dev/null; then
-        base_python="$candidate"
+fi
+if [[ ! -x "$uv_bin" ]]; then
+    printf '%s\n' '未找到 uv，请先安装 uv。' >&2
+    exit 1
+fi
+
+# Do not let an activated environment supply Python packages, native libraries or tools.
+conda_roots=("$HOME/anaconda3" "$HOME/miniconda3")
+if [[ -n "${CONDA_EXE:-}" ]]; then
+    conda_roots+=("$(dirname -- "$(dirname -- "$CONDA_EXE")")")
+fi
+for name in ${!CONDA_PREFIX@}; do
+    [[ -z "${!name}" ]] || conda_roots+=("${!name}")
+done
+IFS=: read -r -a path_entries <<< "${PATH:-/usr/local/bin:/usr/bin:/bin}"
+clean_path="$project_dir/.venv/bin"
+for entry in "${path_entries[@]}"; do
+    [[ -n "$entry" ]] || continue
+    skip=false
+    for prefix in "${conda_roots[@]}"; do
+        if [[ "$entry" == "$prefix" || "$entry" == "$prefix/"* ]]; then
+            skip=true
+            break
+        fi
+    done
+    [[ "$skip" == true ]] || clean_path+=":$entry"
+done
+export PATH="$clean_path"
+unset VIRTUAL_ENV _CE_CONDA _CE_M
+for name in ${!CONDA_@}; do unset "$name"; done
+unset UV_PROJECT UV_WORKING_DIR UV_ENV_FILE UV_PYTHON UV_PYTHON_PREFERENCE
+unset UV_NO_MANAGED_PYTHON UV_ISOLATED UV_NO_PROJECT UV_CONFIG_FILE UV_NO_CONFIG
+export UV_PROJECT_ENVIRONMENT="$project_dir/.venv"
+
+# Qt's bundled plugin path must stay absolute for this project's non-ASCII path.
+unset QT_PLUGIN_PATH QT_QPA_PLATFORM_PLUGIN_PATH QML_IMPORT_PATH QML2_IMPORT_PATH
+for qt_plugins in "$project_dir"/.venv/lib/python*/site-packages/PyQt5/Qt5/plugins; do
+    if [[ -d "$qt_plugins/platforms" ]]; then
+        export QT_PLUGIN_PATH="$qt_plugins"
+        export QT_QPA_PLATFORM_PLUGIN_PATH="$qt_plugins/platforms"
+        break
     fi
 done
-if [[ -z "$base_python" ]]; then
-    echo '未找到带 Tkinter 的 Python。Ubuntu / Debian 请安装 python3-tk，或设置 GITHUB_UPLOAD_PYTHON。' >&2
+
+uv_command=("$uv_bin" run --project "$project_dir" --python "$project_python" --no-sync --no-env-file --)
+if ! "${uv_command[@]}" python -c 'from PyQt5 import QtCore, QtGui, QtWidgets'; then
+    dependency_help
     exit 1
 fi
-
-if command -v uv >/dev/null 2>&1; then
-    export UV_CACHE_DIR="$project_dir/.cache/uv-github-upload"
-    exec uv run --no-project --python "$base_python" \
-        --with 'customtkinter>=5.2.2,<6' --with 'Pillow>=10,<13' \
-        python "$script_dir/github_upload_gui.py" "$@"
-fi
-
-echo '首次启动：正在准备独立的 CustomTkinter 界面环境……'
-# Use a fresh directory if a cache from another Python version is already present.
-env_dir="$project_dir/.cache/github-upload-runtime"
-env_python="$env_dir/bin/python"
-if [[ -x "$env_python" ]] && "$env_python" -c 'import tkinter, customtkinter; from PIL import Image' 2>/dev/null; then
-    exec "$env_python" "$script_dir/github_upload_gui.py" "$@"
-fi
-"$base_python" -m venv --without-pip "$env_dir"
-if ! python3 -m pip --version >/dev/null 2>&1; then
-    echo '需要 uv 或支持 --python 的 pip 来安装界面依赖，请安装其中一个后重试。' >&2
-    exit 1
-fi
-python3 -m pip --python "$env_python" --cache-dir "$project_dir/.cache/pip-github-upload" \
-    install 'customtkinter>=5.2.2,<6' 'Pillow>=10,<13'
-exec "$env_python" "$script_dir/github_upload_gui.py" "$@"
+exec "${uv_command[@]}" python "$script_dir/github_upload_gui.py" "$@"

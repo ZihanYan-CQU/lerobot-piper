@@ -1,6 +1,6 @@
 This file provides guidance to AI agents when working with code in this repository.
 
-> **User-facing help → [`AGENT_GUIDE.md`](./AGENT_GUIDE.md)** (SO-101 setup, recording, picking a policy, training duration, eval — with copy-pasteable commands).
+> **User-facing help → [`AGENT_GUIDE.md`](./AGENT_GUIDE.md)** (Piper setup, data collection, training, deployment, DAgger / RECAP, and troubleshooting).
 
 ## Project Overview
 

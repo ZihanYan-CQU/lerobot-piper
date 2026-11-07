@@ -93,6 +93,9 @@ dependencies = [
 # Optional dependencies
 [project.optional-dependencies]
 
+# Desktop tools use the stable project environment (not uv --with caches).
+desktop = ["customtkinter>=5.2.2,<6", "PyQt5>=5.15.10,<6"]
+
 # ── Feature-scoped extras ──────────────────────────────────
 lancedb = [
     "lerobot[dataset]",
@@ -301,6 +304,7 @@ metaworld = ["lerobot[dataset]", "metaworld==3.0.0", "lerobot[scipy-dep]"]
 
 # All
 all = [
+    "lerobot[desktop]",
     # Feature-scoped extras
     "lerobot[dataset]",
     "lerobot[lancedb]",
@@ -380,7 +384,7 @@ lerobot-rollout="lerobot.scripts.lerobot_rollout:main"
 # ---------------- Tool Configurations ----------------
 
 [tool.uv]
-# Keep the project interpreter independent of Conda's shared libraries.
+# Select uv-managed Python; launchers separately isolate Python and library search paths.
 python-preference = "only-managed"
 
 [[tool.uv.index]]
@@ -389,9 +393,8 @@ url = "https://pypi.tuna.tsinghua.edu.cn/simple"
 default = true
 
 # cu128 wheels keep broad hardware reach; the driver floor is 570.86.
-# To use a different CUDA variant, reinstall torch with an explicit index, e.g.:
-#   uv pip install --force-reinstall torch torchvision \
-#       --index-url https://download.pytorch.org/whl/cu130
+# To change CUDA variants, update this index and tool.uv.sources together, then
+# regenerate uv.lock and validate the chosen driver/runtime before syncing.
 [[tool.uv.index]]
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"

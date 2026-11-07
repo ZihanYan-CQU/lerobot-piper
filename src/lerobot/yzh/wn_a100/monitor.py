@@ -15,6 +15,7 @@ import math
 import os
 import queue
 import re
+import shutil
 import ssl
 import sys
 import threading
@@ -1059,21 +1060,96 @@ def autostart_path() -> Path:
     return config_home / "autostart" / "wn-a100-monitor.desktop"
 
 
+def project_uv_command() -> list[str]:
+    """Build a direct uv command with a fixed project and isolated desktop environment."""
+    project_root = next(
+        (
+            parent
+            for parent in Path(__file__).resolve().parents
+            if (parent / "pyproject.toml").is_file()
+            and (parent / "src" / "lerobot" / "yzh" / "wn_a100").is_dir()
+        ),
+        None,
+    )
+    if project_root is None:
+        raise SystemExit("无法找到项目 pyproject.toml；请在完整项目中安装启动项。")
+    project_python = project_root / ".venv" / "bin" / "python"
+    if not os.access(project_python, os.X_OK):
+        raise SystemExit("项目环境不存在；请先执行 uv sync --locked --inexact --extra desktop。")
+    uv_path = Path.home() / ".local" / "bin" / "uv"
+    uv_executable = str(uv_path) if os.access(uv_path, os.X_OK) else shutil.which("uv")
+    if not uv_executable:
+        raise SystemExit("未找到 uv；请先安装独立 uv 并加入 PATH。")
+    cleared_variables = (
+        "PYTHONHOME",
+        "PYTHONPATH",
+        "PYTHONUSERBASE",
+        "LD_LIBRARY_PATH",
+        "LD_PRELOAD",
+        "VIRTUAL_ENV",
+        "VIRTUAL_ENV_PROMPT",
+        "CONDA_PREFIX",
+        "CONDA_PREFIX_1",
+        "CONDA_SHLVL",
+        "CONDA_DEFAULT_ENV",
+        "CONDA_EXE",
+        "CONDA_PYTHON_EXE",
+        "CONDA_PROMPT_MODIFIER",
+        "_CE_CONDA",
+        "_CE_M",
+        "UV_PROJECT",
+        "UV_WORKING_DIR",
+        "UV_PROJECT_ENVIRONMENT",
+        "UV_ENV_FILE",
+        "UV_PYTHON",
+        "UV_PYTHON_PREFERENCE",
+        "UV_NO_MANAGED_PYTHON",
+        "UV_ISOLATED",
+        "UV_NO_PROJECT",
+        "UV_CONFIG_FILE",
+        "UV_NO_CONFIG",
+        "QT_PLUGIN_PATH",
+        "QT_QPA_PLATFORM_PLUGIN_PATH",
+        "QML_IMPORT_PATH",
+        "QML2_IMPORT_PATH",
+    )
+    command = ["/usr/bin/env"]
+    for variable in cleared_variables:
+        command.extend(("-u", variable))
+    path = ":".join(
+        (
+            str(project_python.parent), str(Path.home() / ".local" / "bin"),
+            "/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin",
+        )
+    )
+    command.extend(
+        (
+            f"PATH={path}", "PYTHONNOUSERSITE=1", f"UV_PROJECT_ENVIRONMENT={project_root / '.venv'}",
+            str(Path(uv_executable).absolute()), "run", "--project", str(project_root),
+            "--python", str(project_python), "--no-sync", "--no-env-file", "--",
+            "python", "-m", "lerobot.yzh.wn_a100",
+        )
+    )
+    return command
+
+
 def install_autostart(args: argparse.Namespace) -> Path:
+    """Create a desktop entry invoking uv directly in the existing project environment."""
+    command = project_uv_command()
     destination = autostart_path()
     destination.parent.mkdir(parents=True, exist_ok=True)
-    command = [
-        sys.executable,
-        str(Path(__file__).resolve().parent.parent / "2.wn_a100_monitor.py"),
-        "--api-base",
-        args.api_base,
-        "--server-id",
-        args.server_id,
-        "--server-name",
-        args.server_name,
-        "--interval",
-        str(args.interval),
-    ]
+    command.extend(
+        (
+            "--api-base",
+            args.api_base,
+            "--server-id",
+            args.server_id,
+            "--server-name",
+            args.server_name,
+            "--interval",
+            str(args.interval),
+        )
+    )
     if args.no_topmost:
         command.append("--no-topmost")
     if args.no_training:
@@ -1298,7 +1374,10 @@ def main(argv: list[str] | None = None) -> int:
     except ModuleNotFoundError as exc:
         if exc.name and exc.name.startswith("PyQt5"):
             print(
-                "桌面界面需要 PyQt5，请安装：uv pip install 'PyQt5>=5.15.10,<6'",
+                "桌面界面需要 PyQt5。请在项目根目录执行：\n"
+                "  uv sync --locked --inexact --extra desktop\n"
+                "同步时同时保留本机其他所需 extra，再通过 uv run --no-sync 运行对应命令。\n"
+                f"当前解释器：{sys.executable}",
                 file=sys.stderr,
             )
             return 2

@@ -36,6 +36,7 @@ from tests.mocks.mock_robot import MockRobotConfig
 class _FakeController:
     def __init__(self):
         self.calls = []
+        self.planned_commands = []
         self.pose = {f"motor_{index}.pos": 0.0 for index in range(1, 4)}
 
     def prepare_autonomy(self):
@@ -62,6 +63,10 @@ class _FakeController:
         self.pose = dict(performed)
         self.calls.append(("send", performed))
         return performed
+
+    def send_planned_action(self, action):
+        self.planned_commands.append(dict(action))
+        return self.send_same_action(action)
 
     def read_expert_action(self):
         return dict(self.pose)
@@ -171,6 +176,14 @@ def _chunk(source_observation_id, values):
         conditioned_delay=0,
         prefix_length=0,
     )
+
+
+def test_reset_routes_all_commands_through_planned_dual_arm_entrypoint(tmp_path):
+    client, controller, _ = _make_client(tmp_path)
+    assert client.reset_rollout()
+    sent = [command for command in controller.calls if isinstance(command, tuple) and command[0] == "send"]
+    assert controller.planned_commands
+    assert controller.planned_commands == [command[1] for command in sent]
 
 
 def test_dagger_inherits_paper_rtc_splice_default(tmp_path):

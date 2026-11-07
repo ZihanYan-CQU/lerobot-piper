@@ -1,3 +1,5 @@
+> **Piper 本项目文档：[总导航](docs/README.md) · [数采](docs/workflows/recording/README.md) · [指示灯](docs/workflows/tools/status-indicator.md) · [仿真](docs/workflows/simulation/README.md) · [数据处理](docs/workflows/datasets/README.md) · [训练](docs/workflows/training/README.md) · [RLT](docs/workflows/rlt/README.md) · [真机部署](docs/workflows/deployment/README.md) · [DAgger](docs/workflows/dagger/README.md) · [问题排查](docs/troubleshooting/README.md) · [代码架构](docs/architecture/README.md)**
+
 <p align="center">
   <img alt="LeRobot, Hugging Face Robotics Library" src="./media/readme/lerobot-logo-thumbnail.png" width="100%">
 </p>

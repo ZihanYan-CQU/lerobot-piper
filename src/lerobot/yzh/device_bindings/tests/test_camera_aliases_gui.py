@@ -2,15 +2,15 @@
 
 import importlib.util
 import os
-import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 SCRIPTS = Path(__file__).resolve().parents[1]
-for name in ("camera_aliases", "can_port_bindings", "camera_aliases_gui"):
+for name in ("camera_aliases", "can_port_bindings", "privileged_session", "binding_checks", "camera_aliases_gui"):
     if name not in sys.modules:
         spec = importlib.util.spec_from_file_location(name, SCRIPTS / f"{name}.py")
         module = importlib.util.module_from_spec(spec)
@@ -44,17 +44,11 @@ class CameraPanelTest(unittest.TestCase):
                 bindings = gui.saved_bindings(self.devices)
         self.assertEqual(bindings, self.mappings + [(None, "video_extra")])
 
-    def test_install_command_authenticates_and_supplies_all_expected_identities(self):
-        with patch.object(gui.os, "geteuid", return_value=1000), patch.object(gui.shutil, "which", return_value="/usr/bin/pkexec"):
-            command = gui.install_command(self.devices, self.mappings)
-        self.assertEqual(command[:2], ["/usr/bin/pkexec", "/usr/bin/python3"])
-        self.assertEqual(command.count("--map"), 2)
-        expected = [command[index + 1] for index, value in enumerate(command) if value == "--expect-camera"]
-        core.validate_selections(self.devices, self.mappings, expected)
-
-    def test_already_elevated_installer_does_not_prompt_again(self):
-        with patch.object(gui.os, "geteuid", return_value=0):
-            self.assertEqual(gui.install_command(self.devices, self.mappings)[0], "/usr/bin/python3")
+    def test_camera_request_supplies_all_expected_identities(self):
+        request = gui.camera_request(self.devices, self.mappings)
+        self.assertEqual(request["operation"], "camera")
+        self.assertEqual(request["mappings"], [f"{node}={alias}" for node, alias in self.mappings])
+        core.validate_selections(self.devices, self.mappings, request["expected"])
 
     def test_rows_reject_missing_and_duplicate_camera_selections(self):
         panel = gui.CameraPanel.__new__(gui.CameraPanel)
@@ -71,18 +65,86 @@ class CameraPanelTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     panel.selections()
 
-    def test_can_command_carries_both_roles_bitrate_and_device_identities(self):
+    def test_can_request_carries_selected_roles_bitrate_and_device_identities(self):
         ports = [
             can.CanPort("can0", "1-1.2:1.0", 7, "master", False),
             can.CanPort("can1", "1-1.3:1.0", 8, "follower", False),
         ]
-        with patch.object(gui.os, "geteuid", return_value=0):
-            command = gui.can_install_command(ports, ports[0].usb, ports[1].usb, 1000000)
-        self.assertIn("--master", command)
-        self.assertIn("--follower", command)
-        self.assertEqual(command[command.index("--bitrate") + 1], "1000000")
-        expected = [command[index + 1] for index, value in enumerate(command) if value == "--expect-port"]
-        can.validate_expected([(ports[0], "can_master"), (ports[1], "can_follower")], expected)
+        request = gui.can_request(ports, ports[0].usb, ports[1].usb, 1000000)
+        self.assertEqual((request["master"], request["follower"], request["bitrate"]), (ports[0].usb, ports[1].usb, 1000000))
+        can.validate_expected([(ports[0], "can_master"), (ports[1], "can_follower")], request["expected"])
+        request = gui.can_request(ports, None, ports[1].usb, 500000)
+        self.assertIsNone(request["master"])
+        can.validate_expected([(ports[1], "can_follower")], request["expected"])
+
+    def test_can_panel_allows_either_single_role_but_rejects_empty_or_duplicate_roles(self):
+        panel = gui.CanPanel.__new__(gui.CanPanel)
+        panel.ports = [can.CanPort("can0", "1-1.2:1.0", 7, "master", False)]
+        panel.bitrate = Mock()
+        panel.bitrate.get_child().get_text.return_value = "1000000"
+        for values in (("1-1.2:1.0", ""), ("", "1-1.2:1.0"), ("", ""), ("1-1.2:1.0", "1-1.2:1.0")):
+            with self.subTest(values=values):
+                panel.rows = [{"combo": Mock()} for _ in values]
+                for row, value in zip(panel.rows, values, strict=True):
+                    row["combo"].get_active_id.return_value = value
+                if values.count("") == 1:
+                    self.assertEqual(panel.selections(), tuple(value or None for value in values) + (1000000,))
+                else:
+                    with self.assertRaises(ValueError):
+                        panel.selections()
+
+    def test_result_summary_excludes_skipped_roles_and_is_invalidated_after_an_edit(self):
+        panel = gui.DevicePanel.__new__(gui.DevicePanel)
+        panel.check_summary, panel.check_details = Mock(), Mock()
+        panel.update_validation = Mock()
+        panel.show_checks([
+            gui.checks.BindingCheck("主臂", None, "本次不配置"),
+            gui.checks.BindingCheck("从臂", True, "已绑定并启用"),
+        ])
+        self.assertIn("全部已绑定 · 1/1", panel.check_summary.set_text.call_args.args[0])
+        self.assertIn("[未检查] 主臂", panel.check_details.set_text.call_args.args[0])
+        panel.configuration_changed()
+        self.assertEqual(panel.check_summary.set_text.call_args.args[0], "配置已更改，请重新检查")
+        panel.show_checks([gui.checks.BindingCheck("从臂", False, "接口未启用")])
+        self.assertIn("存在未就绪项", panel.check_summary.set_text.call_args.args[0])
+        panel.show_checks([gui.checks.BindingCheck("从臂", None, "本次不配置")])
+        self.assertIn("尚未选择", panel.check_summary.set_text.call_args.args[0])
+
+    def test_can_check_snapshots_widgets_before_worker_and_never_requests_authorization(self):
+        panel = gui.CanPanel.__new__(gui.CanPanel)
+        port = can.CanPort("can_follower", "1-9.3:1.0", 7, "follower", True, 1000000)
+        panel.ports = [port]
+        panel.session = Mock()
+        panel.rows = [{"combo": Mock()}, {"combo": Mock()}]
+        panel.bitrate = Mock()
+        main_thread = threading.get_ident()
+
+        def widget(value):
+            self.assertEqual(threading.get_ident(), main_thread, "GTK fields must be read on the main thread")
+            return value
+
+        panel.rows[0]["combo"].get_active_id.side_effect = lambda: widget("")
+        panel.rows[1]["combo"].get_active_id.side_effect = lambda: widget(port.usb)
+        panel.bitrate.get_child().get_text.side_effect = lambda: widget("1000000")
+        panel.run_check = Mock()
+        panel.check_bindings()
+        work = panel.run_check.call_args.args[0]
+        results, errors = [], []
+
+        def worker():
+            try:
+                results.extend(work())
+            except Exception as exc:
+                errors.append(exc)
+
+        with patch.object(can, "discover_ports", return_value=[port]) as discover:
+            thread = threading.Thread(target=worker)
+            thread.start()
+            thread.join(timeout=3)
+        self.assertFalse(errors)
+        self.assertTrue(results[1].ok)
+        discover.assert_called_once_with(strict=True)
+        panel.session.execute.assert_not_called()
 
 
 @unittest.skipUnless(os.environ.get("CAMERA_GUI_TEST") == "1", "Set CAMERA_GUI_TEST=1 inside a desktop session")
@@ -131,8 +193,7 @@ class NativePanelTest(unittest.TestCase):
                 self.assertTrue(panel.save_button.get_sensitive())
                 with (
                     patch.object(core, "check_conflicts"),
-                    patch.object(gui, "install_command", return_value=["mock-installer"]),
-                    patch.object(gui.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "已验证", "")) as install,
+                    patch.object(panel.session, "execute", return_value="已验证") as install,
                 ):
                     panel.save()
                     self.assertFalse(panel.save_button.get_sensitive())
@@ -194,19 +255,28 @@ class NativePanelTest(unittest.TestCase):
             try:
                 pump_until(lambda: cameras.loaded and arms.loaded)
                 self.assertEqual(notebook.get_n_pages(), 2)
+                self.assertIs(cameras.session, arms.session)
                 notebook.set_current_page(1)
                 self.assertEqual(arms.selections(), ("1-1.2:1.0", "1-1.3:1.0", 1000000))
                 self.assertTrue(arms.save_button.get_sensitive())
                 arms.rows[1]["combo"].set_active_id("1-1.2:1.0")
                 self.assertFalse(arms.save_button.get_sensitive())
                 arms.rows[1]["combo"].set_active_id("1-1.3:1.0")
+                arms.rows[0]["combo"].set_active_id("")
+                self.assertEqual(arms.selections(), (None, "1-1.3:1.0", 1000000))
+                self.assertTrue(arms.save_button.get_sensitive())
+                arms.rows[1]["combo"].set_active_id("")
+                self.assertFalse(arms.save_button.get_sensitive())
+                arms.rows[0]["combo"].set_active_id("1-1.2:1.0")
+                self.assertEqual(arms.selections(), ("1-1.2:1.0", None, 1000000))
+                self.assertTrue(arms.save_button.get_sensitive())
+                arms.rows[1]["combo"].set_active_id("1-1.3:1.0")
                 arms.bitrate.get_child().set_text("0")
                 self.assertFalse(arms.save_button.get_sensitive())
                 arms.bitrate.get_child().set_text("1000000")
                 self.assertTrue(arms.save_button.get_sensitive())
                 with (
-                    patch.object(gui, "can_install_command", return_value=["mock-can-installer"]),
-                    patch.object(gui.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "已验证：主从臂 CAN", "")) as activate,
+                    patch.object(arms.session, "execute", return_value="已验证：主从臂 CAN") as activate,
                 ):
                     arms.save()
                     self.assertFalse(arms.save_button.get_sensitive())

@@ -37,7 +37,6 @@ from lerobot.yzh.wn_a100.desktop import (
     TRAINING_CAROUSEL_INTERVAL,
     TRAINING_TRANSITION_DURATION,
     BALL_AVAILABILITY_PAGE,
-    BALL_UNMATCHED_TASK_PAGE,
     BALL_DISK_PAGE,
     BALL_SUMMARY_PAGE,
     BALL_SSH_LOGIN_PAGE,
@@ -270,7 +269,7 @@ def test_ssh_logged_out_ball_disables_private_pages_and_rings(
     assert window._ball_page_set == (public, BALL_SSH_LOGIN_PAGE)
     assert not any(
         page in window._ball_page_set
-        for page in (0, 1, BALL_DISK_PAGE, BALL_UNMATCHED_TASK_PAGE)
+        for page in (0, 1, BALL_DISK_PAGE)
     )
     assert drawn_arcs == []
     assert window._training_ring_at(training_ring_position(window, 0)) is None

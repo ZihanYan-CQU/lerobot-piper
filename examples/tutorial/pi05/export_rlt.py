@@ -50,7 +50,11 @@ def export_rlt(
         return merge_adapter(
             str(checkpoint), output_dir, device=device, revision=revision, rlt_encoder_only=True
         )
-    config = replace(config, device=device, compile_model=False, gradient_checkpointing=False)
+    # Export the saved processor/tokenizer together; a training-time external
+    # tokenizer path must not override the checkpoint's bundled assets.
+    config = replace(
+        config, device=device, compile_model=False, gradient_checkpointing=False, text_tokenizer_name=None
+    )
     preprocessor, postprocessor = make_pre_post_processors(
         config,
         pretrained_path=checkpoint,

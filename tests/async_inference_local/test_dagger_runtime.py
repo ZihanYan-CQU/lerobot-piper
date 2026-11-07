@@ -118,6 +118,9 @@ class Controller:
         self.robot.pose = dict(pose)
         return dict(pose)
 
+    def send_planned_action(self, pose):
+        return self.send_same_action(pose)
+
     def read_reset_feedback(self, timeout_s):
         assert timeout_s > 0
         self.feedback_calls += 1

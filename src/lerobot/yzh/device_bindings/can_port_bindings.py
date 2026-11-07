@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bind Piper master/follower CAN ports using the bundled can_activate.sh."""
+"""Discover, bind, and activate selected USB CAN ports with checked ip commands."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 SYS_NET = Path("/sys/class/net")
-ACTIVATE_SCRIPT = Path(__file__).resolve().with_name("can_activate.sh")
 USB_PATTERN = r"[0-9]+-[0-9]+(?:\.[0-9]+)*:[0-9]+\.[0-9]+"
 DEFAULT_MASTER = "1-1.2:1.0"
 DEFAULT_FOLLOWER = "1-1.3:1.0"
@@ -84,25 +83,40 @@ def identity_token(port: CanPort) -> str:
     return hashlib.sha256(json.dumps([port.usb, port.ifindex, port.serial]).encode()).hexdigest()
 
 
-def validate_bindings(ports: list[CanPort], master: str, follower: str, bitrate: int) -> list[tuple[CanPort, str]]:
-    """Resolve both roles and validate the entire request before changing any interface."""
+def validate_bitrate(bitrate: int) -> None:
+    """Reject unsupported rates before any interface is changed."""
     if not 1 <= bitrate <= 1_000_000:
         raise ValueError("CAN 波特率必须在 1 到 1000000 之间。")
-    if master == follower:
+
+
+def resolve_binding(ports: list[CanPort], usb: str, name: str) -> tuple[CanPort, str]:
+    """Resolve a USB identity to exactly one connected CAN adapter."""
+    if not re.fullmatch(USB_PATTERN, usb):
+        raise ValueError(f"USB 端口格式无效：{usb}")
+    matches = [port for port in ports if port.usb == usb]
+    if len(matches) != 1:
+        raise ValueError(f"无法唯一找到 USB CAN 端口 {usb}，请连接设备后刷新。")
+    return matches[0], name
+
+
+def validate_bindings(
+    ports: list[CanPort], master: str | None, follower: str | None, bitrate: int
+) -> list[tuple[CanPort, str]]:
+    """Validate the selected roles; an omitted role is never configured."""
+    validate_bitrate(bitrate)
+    if not master and not follower:
+        raise ValueError("请至少为一只机械臂选择 USB CAN 端口；另一只可保持“本次不配置”。")
+    if master and master == follower:
         raise ValueError("主臂和从臂必须选择不同的 USB CAN 端口。")
-    bindings = []
-    for usb, name in ((master, "can_master"), (follower, "can_follower")):
-        if not re.fullmatch(USB_PATTERN, usb):
-            raise ValueError(f"USB 端口格式无效：{usb}")
-        matches = [port for port in ports if port.usb == usb]
-        if len(matches) != 1:
-            raise ValueError(f"无法唯一找到 USB CAN 端口 {usb}，请连接设备后刷新。")
-        bindings.append((matches[0], name))
-    return bindings
+    return [
+        resolve_binding(ports, usb, name)
+        for usb, name in ((master, "can_master"), (follower, "can_follower"))
+        if usb
+    ]
 
 
 def validate_expected(bindings: list[tuple[CanPort, str]], expected: list[str]) -> None:
-    """Reject stale GUI selections before activating either arm port."""
+    """Reject stale GUI selections before activating the selected arm ports."""
     tokens = {}
     for item in expected:
         usb, separator, token = item.partition("=")
@@ -160,18 +174,11 @@ def restore_ports(originals: list[CanPort]) -> str:
 
 
 def apply_bindings(bindings: list[tuple[CanPort, str]], bitrate: int) -> None:
-    """Call can_activate.sh for both roles and verify the actual kernel state."""
+    """Configure only selected adapters, verifying kernel state and recovering on failure."""
     if os.geteuid() != 0:
         raise PermissionError("激活 CAN 接口需要管理员权限，请使用面板的系统授权或 sudo。")
-    if not ACTIVATE_SCRIPT.is_file():
-        raise ValueError(f"找不到现有激活脚本：{ACTIVATE_SCRIPT}")
-    for executable in ("bash", "ip", "ethtool", "sudo", "dpkg-query"):
-        if shutil.which(executable) is None:
-            raise RuntimeError(f"缺少系统命令 {executable}，请安装后重试。")
-    for package in ("ethtool", "can-utils"):
-        status = run("dpkg-query", "-W", "-f=${Status}", package).strip()
-        if status != "install ok installed":
-            raise RuntimeError(f"请先安装系统软件包 {package}。")
+    if shutil.which("ip") is None:
+        raise RuntimeError("缺少系统命令 ip，请安装 iproute2 后重试。")
 
     selected_names = {port.name for port, _ in bindings}
     for _, target in bindings:
@@ -183,7 +190,7 @@ def apply_bindings(bindings: list[tuple[CanPort, str]], bitrate: int) -> None:
         find_current(port)
     changed = []
     try:
-        # Free both final names before invoking the existing script, allowing master/follower swaps.
+        # Free the selected names first, allowing master/follower swaps.
         for index, (port, target) in enumerate(bindings):
             if port.name != target:
                 current = find_current(port)
@@ -196,7 +203,11 @@ def apply_bindings(bindings: list[tuple[CanPort, str]], bitrate: int) -> None:
                 continue
             if original not in changed:
                 changed.append(original)
-            run("bash", str(ACTIVATE_SCRIPT), target, str(bitrate), original.usb)
+            run("ip", "link", "set", "dev", current.name, "down")
+            if current.name != target:
+                run("ip", "link", "set", "dev", current.name, "name", target)
+            run("ip", "link", "set", "dev", target, "type", "can", "bitrate", str(bitrate))
+            run("ip", "link", "set", "dev", target, "up")
             current = find_current(original)
             if current.name != target or not current.up or current.bitrate != bitrate:
                 raise RuntimeError(f"{original.usb} 激活后的名称、波特率或启用状态与请求不符。")
@@ -211,13 +222,15 @@ def apply_bindings(bindings: list[tuple[CanPort, str]], bitrate: int) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Expose the same two bindings to the GUI and a standalone command line."""
+    """Support one or both arm roles, plus the legacy shell entry point."""
     parser = argparse.ArgumentParser(description="绑定并激活 Piper 主臂/从臂 USB CAN 接口。")
     operation = parser.add_mutually_exclusive_group()
     operation.add_argument("--list", action="store_true", help="只列出 USB CAN 端口")
-    operation.add_argument("--dry-run", action="store_true", help="只预览对应的 can_activate.sh 命令")
-    parser.add_argument("--master", default=DEFAULT_MASTER)
-    parser.add_argument("--follower", default=DEFAULT_FOLLOWER)
+    operation.add_argument("--dry-run", action="store_true", help="只预览所选端口的目标名称与波特率")
+    parser.add_argument("--master", help=f"主臂 USB 端口；两个角色均不指定时默认为 {DEFAULT_MASTER}")
+    parser.add_argument("--follower", help=f"从臂 USB 端口；两个角色均不指定时默认为 {DEFAULT_FOLLOWER}")
+    parser.add_argument("--interface", help="单接口模式的目标名称，供 can_activate.sh 兼容入口使用")
+    parser.add_argument("--usb", help="单接口模式的 USB 端口；仅连接一个适配器时可省略")
     parser.add_argument("--bitrate", type=int, default=1_000_000)
     parser.add_argument("--expect-port", action="append", default=[], help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
@@ -227,12 +240,27 @@ def main(argv: list[str] | None = None) -> int:
             for port in ports:
                 print(f"{port.usb}  {port.name}  {'UP' if port.up else 'DOWN'}  波特率={port.bitrate or '未设置/未读取'}")
             return 0
-        bindings = validate_bindings(ports, args.master, args.follower, args.bitrate)
+        if args.interface is not None:
+            if args.master is not None or args.follower is not None:
+                raise ValueError("--interface 不能与 --master 或 --follower 同时使用。")
+            if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,14}", args.interface):
+                raise ValueError("接口名称须为 1 到 15 位字母、数字、下划线、点或连字符，且不能以点或连字符开头。")
+            validate_bitrate(args.bitrate)
+            usb = args.usb or (ports[0].usb if len(ports) == 1 else None)
+            if usb is None:
+                raise ValueError("存在多个或没有 USB CAN 端口，请明确指定 --usb。")
+            bindings = [resolve_binding(ports, usb, args.interface)]
+        else:
+            if args.usb is not None:
+                raise ValueError("--usb 需与 --interface 一起使用。")
+            if args.master is None and args.follower is None:
+                args.master, args.follower = DEFAULT_MASTER, DEFAULT_FOLLOWER
+            bindings = validate_bindings(ports, args.master, args.follower, args.bitrate)
         if args.expect_port:
             validate_expected(bindings, args.expect_port)
         if args.dry_run:
             for port, name in bindings:
-                print(f'bash {ACTIVATE_SCRIPT} {name} {args.bitrate} "{port.usb}"')
+                print(f"{port.usb} → {name}，波特率 {args.bitrate}（当前：{port.name}）")
             return 0
         apply_bindings(bindings, args.bitrate)
         return 0

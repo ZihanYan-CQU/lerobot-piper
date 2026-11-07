@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import time
-from threading import Lock
+from threading import Event, Lock
 from typing import Any
 
 import numpy as np
@@ -109,15 +109,36 @@ class RobotIO:
             value.setflags(write=False)
         return value
 
-    def send(self, values: np.ndarray, *, deadline: float | None = None) -> np.ndarray:
+    def send(
+        self, values: np.ndarray, *, deadline: float | None = None, stop_event: Event | None = None
+    ) -> np.ndarray:
         """Apply one finite CPU command and return the driver-reported target."""
+        return self._send(values, deadline=deadline, planned=False, stop_event=stop_event)
+
+    def send_planned(self, values: np.ndarray) -> np.ndarray:
+        """Use the robot's planned positioning entrypoint for reset waypoints."""
+        return self._send(values, deadline=None, planned=True)
+
+    @staticmethod
+    def _check_send_guard(deadline: float | None, stop_event: Event | None) -> None:
+        """Called with the motor lock held, immediately before a driver write."""
+        if stop_event is not None and stop_event.is_set():
+            raise InterruptedError("Robot command cancelled while waiting for motor I/O")
+        if deadline is not None and time.monotonic() > deadline:
+            raise TimeoutError("Action source expired while waiting for motor I/O")
+
+    def _send(
+        self, values: np.ndarray, *, deadline: float | None, planned: bool, stop_event: Event | None = None
+    ) -> np.ndarray:
         if values.shape != (len(self.action_keys),) or not np.isfinite(values).all():
             raise ValueError("Invalid robot command shape or values")
         requested = dict(zip(self.action_keys, map(float, values), strict=True))
         with self._motor_lock:
-            if deadline is not None and time.monotonic() > deadline:
-                raise TimeoutError("Action source expired while waiting for motor I/O")
-            applied = self.robot.send_action(requested)
+            sender = getattr(self.robot, "send_action_planned", None) if planned else None
+            if not callable(sender):
+                sender = self.robot.send_action
+            self._check_send_guard(deadline, stop_event)
+            applied = sender(requested)
         applied = requested if applied is None else self._validate_pose(applied)
         return np.asarray([applied[key] for key in self.action_keys], dtype=np.float32)
 

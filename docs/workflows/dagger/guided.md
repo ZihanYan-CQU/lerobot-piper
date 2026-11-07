@@ -1,0 +1,129 @@
+# 远端 DAgger 人工纠正采集：guided RTC
+
+[流程目录](README.md) · [环境准备](../setup/README.md) · [SSH 连接](../deployment/connection.md)
+
+所有命令从对应机器的仓库根目录执行。顺序为 GPU 服务器 → 机器人电脑建立 SSH 隧道 → 机器人客户端。服务端与客户端使用同一代码版本和 RTC 模式，同一端口只启动一个服务。
+
+## 1. GPU 服务器（S3）
+
+本终端先定义地址与日志目录，再运行下方服务。常规推理取消会改变 CUDA 时序的调试环境变量。模型由客户端指定，服务端读取。
+
+```bash
+SERVER_HOST='127.0.0.1'
+SERVER_PORT=8080
+FAULT_LOG_DIR='/home/yzh/具身智能/DEBUG日志/'
+
+mkdir -p "$FAULT_LOG_DIR"
+export PYTHONFAULTHANDLER=1
+unset CUDA_LAUNCH_BLOCKING TORCH_SHOW_CPP_STACKTRACES
+```
+
+```bash
+CUDA_VISIBLE_DEVICES=2 uv run --no-sync python -m lerobot.async_inference.server.policy_server_dagger \
+  --host="$SERVER_HOST" \
+  --port="$SERVER_PORT" \
+  --fps=30 \
+  --inference_latency=0 \
+  --rtc.mode=guided \
+  --rtc.execution_horizon=25 \
+  --reuse_last_policy=true \
+  --pi05_inference.warmup_timeout_s=1800 \
+  --debug_rtc_diagnostics=false \
+  --debug_cuda_sync=false \
+  --rtc.debug=false \
+  --fault_log_path="$FAULT_LOG_DIR/dagger_guided_crash.log"
+```
+
+本配方保留 `reuse_last_policy=true`。每轮训练若覆盖同一路径，应改成 `--reuse_last_policy=false` 后重启，以免重连继续使用旧权重；DAgger 代码默认值就是 false。同一连接内暂停、接管不会因此重复加载。
+
+本配方未显式覆盖编译与精度参数，沿用所加载 checkpoint 的设置。
+
+## 2. 机器人电脑（C3）
+
+先按 [SSH 连接](../deployment/connection.md)建立隧道（同机可跳过）。在客户端的新终端定义本页变量，然后启动。`MODEL_ROOT` 是服务器路径，`CAMERAS` 中的设备属于机器人电脑；相机名称、任务文本、模型子目录与 checkpoint 都要按实际训练结果核对。
+
+```bash
+SERVER_ADDRESS='127.0.0.1:8080'
+TASK='Place the block on the shape-matching board.'
+
+# 服务器上的模型基础目录；具体模型和 checkpoint 在执行命令中填写。
+MODEL_ROOT='/home/yzh/具身智能/微调模型/Lerobot'
+
+# DAgger 数据集命名空间；每轮采集的具体名称在执行命令中填写。
+DAGGER_DATASET_NAMESPACE='block'
+
+CAMERAS='{
+  "top": {
+    "type": "opencv",
+    "index_or_path": "/dev/video_top",
+    "width": 640,
+    "height": 480,
+    "fps": 30,
+    "rotation": 0
+  },
+  "wrist": {
+    "type": "opencv",
+    "index_or_path": "/dev/video_wrist",
+    "width": 640,
+    "height": 480,
+    "fps": 30,
+    "rotation": 180
+  }
+}'
+```
+
+```bash
+env \
+  -u http_proxy \
+  -u https_proxy \
+  -u HTTP_PROXY \
+  -u HTTPS_PROXY \
+  -u all_proxy \
+  -u ALL_PROXY \
+  -u grpc_proxy \
+  -u GRPC_PROXY \
+uv run --no-sync python -m lerobot.async_inference.client.robot_client_dagger \
+  --server_address="$SERVER_ADDRESS" \
+  --robot.type=piper_follower \
+  --robot.cameras="$CAMERAS" \
+  --policy_type=pi05 \
+  --pretrained_name_or_path="${MODEL_ROOT}/pi0.5_shapeMatching_b32_s20000_dagger_b32_s20000/checkpoints/005000/pretrained_model" \
+  --policy_device=cuda \
+  --actions_per_chunk=50 \
+  --chunk_size_threshold=0.5 \
+  --fps=30 \
+  --interpolation_multiplier=2 \
+  --adaptive_rtt_trigger=true \
+  --rtt_trigger_margin_steps=5 \
+  --robot.teleop_gripper_alpha=1.0 \
+  --robot.teleop_joint_alpha=0.25 \
+  --reset_to_initial_position=true \
+  --reset_duration_s=3.0 \
+  --reset_fps=50 \
+  --rtc_mode=guided \
+  --resize_images_on_client=true \
+  --continuous_observation=true \
+  --observation_max_age_s=0.1 \
+  --startup_calibration_runs=3 \
+  --startup_calibration_timeout_s=1800 \
+  --latency_history_ttl_s=300 \
+  --observation_capture_fps=30 \
+  --debug_rtc_diagnostics=false \
+  --log_rtc_timing=false \
+  --debug_visualize_queue_size=false \
+  --suppress_can_debug_logs=true \
+  --task="$TASK" \
+  --dagger_dataset_repo_id="${DAGGER_DATASET_NAMESPACE}/dagger_0-10" \
+  --dagger_dataset_resume=false \
+  --dagger_dataset_push_to_hub=false \
+  --dagger_num_episodes=10 \
+  --dagger_input_device=keyboard
+```
+
+命令只对当前客户端进程清除代理。客户端保持前台运行，策略频率 30 Hz，插值命令目标频率 60 Hz。
+
+本配方使用默认 `lerobot_float32` 图像上传；如需 OpenPI PIL 缩放/补边，显式添加 `--image_transport_mode=openpi_uint8` 并保留 `--resize_images_on_client=true`，两端同步代码后重启。详见[部署配置](../deployment/configuration.md)。
+
+采集目录默认位于 LeRobot 数据目录下、以 `dagger_dataset_repo_id` 命名；要指定机器人电脑上的路径，添加 `--dagger_dataset_root=/absolute/path/to/dataset`。新建用 `dagger_dataset_resume=false`，已有目录请换名称，或确认续录时显式指定原 root、repo_id 并设为 true。当前命令关闭上传。本次成功保存 10 个纠正 episode 后退出；[按键与采集规则](README.md#操作流程)见流程目录。
+
+客户端的阶段提示、灯色和闪烁含义见[指示灯说明](../tools/status-indicator.md)，不由服务端驱动灯。

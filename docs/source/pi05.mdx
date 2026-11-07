@@ -77,6 +77,10 @@ corresponding local tokenizer directory on that machine.
 
 ### Optional RLinf network backend
 
+For this fork's day-to-day commands, see the [RLT workflow guide](../workflows/rlt/README.md).
+[Architecture](../architecture/rlt.md) and [checkpoint/runtime troubleshooting](../troubleshooting/rlt.md)
+are maintained separately; the complete tutorial below remains the reference for examples and API details.
+
 Set `policy.backend=rlinf` to use the native PyTorch Gemma/SigLIP network
 vendored from RLinf revision `061c4cce80bbab998ef90585475d3f51290a2dfa`.
 `policy.backend=lerobot` remains the default. The policy type stays `pi05`;
@@ -102,10 +106,10 @@ An ordinary checkpoint does not gain
 trained RTC support from conversion: trained RTC still requires
 `rtc_training_max_delay > 0` and compatible trained weights.
 
-The integration also supports opt-in RLT Stage 1 (below). Native RLT weights
-require matching saved structure settings. Other RLinf task-specific heads and
-the Stage 2 actor-critic workflow are outside this integration; strict loading
-rejects extra tensors.
+The integration supports opt-in RLT Stage 1 and the compact Stage 2 actor-critic
+with fixed-window replay described below. Native RLT weights require matching
+saved structure settings. Other RLinf task-specific heads remain unsupported;
+strict loading rejects extra tensors.
 
 To load an existing LeRobot PI05 checkpoint into the new backend:
 
@@ -411,8 +415,9 @@ z_rl = policy.extract_rlt_features(batch)  # (batch_size, rlt_embed_dim)
 actions = post(policy.predict_action_chunk(batch))
 ```
 
-The independent feature/action APIs each run their own prefix pass; a shared
-feature/reference-chunk rollout interface belongs to the future Stage 2 adapter.
+The independent feature/action APIs each run their own prefix pass.
+`predict_action_chunk_with_rlt_features(batch)` returns `(reference_chunk, z_rl)`
+from a single prefix pass for the fixed-window Stage 2 adapter below.
 Stage 1 validation uses real miniature networks, masks and gradients, saved
 processor round trips, optimizer resume, full/PEFT reload and encoder-only
 export. Full-size task training and Piper success rates require a separate run.
@@ -420,6 +425,320 @@ export. Full-size task training and Piper success rates require a separate run.
 Validation uses miniature real networks with gradient updates, checkpoint
 save/resume, adapter reload and merged action comparisons. It does not establish
 full-size training memory requirements or task success on a real Piper.
+
+### RLT Stage 2: actor-critic and fixed execution-window replay
+
+`rlt_actor` is a small trainable policy over frozen Stage 1 features. The
+`rlt_ac` algorithm plugs into the existing algorithm factory and `RLTrainer`.
+Its objective follows the [RLinf RLT actor-critic route](https://github.com/RLinf/RLinf/blob/061c4cce80bbab998ef90585475d3f51290a2dfa/rlinf/workers/actor/fsdp_rlt_ac_policy_worker.py):
+the actor minimizes `-q_weight * Q1 + bc_weight * BC`; twin target critics use
+their minimum Q. Normal steps use the VLA reference as the BC target; human
+intervention steps use the recorded executed command. Reference dropout is
+applied only to the actor input. There is no entropy-temperature optimizer.
+
+The actor outputs **10 policy steps** by default. Its tanh actions and replay
+actions use the saved Stage 1 normalized action coordinates. The actor observes
+the first 10 reference rows, the RL token and normalized proprioception. The
+critics observe the token, proprioception and a complete K-step action; realized
+duration is not an input to Q. The feature dictionary uses these LeRobot names:
+
+| Field | Unbatched shape | Meaning |
+| --- | --- | --- |
+| `observation.rlt` | `(z_dim,)` | Frozen Stage 1 `z_rl` |
+| `observation.state` | `(proprio_dim,)` | Stage 1-normalized state |
+| `observation.reference_chunk` | `(reference_horizon, action_dim)` | Normalized VLA reference |
+
+**Execution windows.** `FixedWindowRollout` commits one window and accepts no
+mid-window reference replacement. After the window, one new observation supplies
+both the previous transition's `next_state` and the next window's `state`.
+This is a separate synchronous collection API. The normal asynchronous RTC
+client, its splicing/compilation path, and Piper driver modes are unchanged.
+The shared Stage 2 feature/reference call is eager and uses `rtc_config=None`;
+the Stage 1 weights can retain their trained-RTC training configuration.
+
+Replay stores **controller-reported sent commands**, including smoothing,
+clipping or human takeover, rather than an unexecuted predicted suffix. A command
+is not a measurement of the reached joint position. Absolute commands are mapped
+back to normalized coordinates with the window's original relative-action anchor.
+There is no second normalization of `z_rl` or proprioception on the learner.
+
+Each transition carries per-policy-step rewards. For `n` executed steps, the
+target is `sum(gamma**i * reward[i]) + (1-terminated) * gamma**n * min(Q_target)`.
+Motor interpolation substeps do not multiply `n`. Early termination or a time
+limit zero-pads unexecuted action receipts and rewards. The valid-step mask
+controls rewards, discounting and BC; Q retains the planned tail as context.
+A time limit still bootstraps and must provide the **final pre-reset observation**. Cancellation,
+disconnect, an invalid reward, or a failed capture drops the partial window and
+requires a fresh `begin_episode`; those events do not manufacture terminal data.
+
+**Freeze and version the feature model.** Export/merge Stage 1 first. Stage 2 uses
+the tokenizer bundled with the saved processors, even when `text_tokenizer_name`
+still points to the original external directory. Legacy processors without a
+tokenizer bundle must be re-exported. A local fingerprint streams weights,
+configs, normalization assets and every bundled tokenizer file once; tokenizer
+directory symlinks must be materialized. Hub inputs require a full commit revision.
+The loader checks this identity against the actor/replay configuration, and each
+sampled batch carries its digest. Changing
+the feature model or processors requires new replay and a matching actor config.
+Direct construction from an in-memory model is available for tests/adapters; its
+caller must supply the same immutable identity contract.
+
+The feature fingerprint now uses the v2 namespace. Recompute the actor config's
+`feature_model_id` and collect new replay after this update. Previous fingerprints
+cannot establish which external tokenizer produced old features, so the frozen
+feature loader rejects old actor/replay identities rather than relabeling them.
+
+```python
+from threading import Event
+
+from lerobot.configs import PreTrainedConfig
+from lerobot.policies.rlt_actor import RLTActorConfig, RLTActorPolicy
+from lerobot.rl.rlt.features import FrozenRLTFeatures, checkpoint_fingerprint
+from lerobot.rl.rlt.replay import FixedWindowReplayBuffer
+from lerobot.rl.rlt.rollout import FixedWindowRollout, RobotWindowStep
+
+stage1 = "/path/to/piper_rlt_inference"
+source = PreTrainedConfig.from_pretrained(stage1)
+cfg = RLTActorConfig(
+    feature_model_id=checkpoint_fingerprint(stage1),
+    z_dim=source.rlt_embed_dim,
+    proprio_dim=source.input_features["observation.state"].shape[0],
+    action_dim=source.output_features["action"].shape[0],
+    execution_horizon=10,
+    reference_horizon=source.chunk_size,
+    device="cuda",
+    push_to_hub=False,
+)
+features = FrozenRLTFeatures.from_pretrained(stage1, cfg, device="cuda")
+actor = RLTActorPolicy(cfg).to("cuda")
+replay = FixedWindowReplayBuffer(cfg, capacity=100_000)
+stop = Event()
+rollout = FixedWindowRollout(features, replay, actor=actor, stop_event=stop)
+```
+
+For an **already connected, exclusively owned** `RobotIO`, provide application
+callbacks `prepare(raw)` and `task_reward(raw, sent_command)`. `prepare` must
+produce the saved PI05 processor's raw batch convention: float images in `[0,1]`,
+state, and task. `task_reward` returns `RewardSignal(reward, terminated, truncated,
+intervention)` from the real task outcome. It is not a learned/default reward model.
+
+```python
+# io, prepare and task_reward are supplied by the robot/environment application.
+step = RobotWindowStep(
+    io, prepare, task_reward,
+    action_names=source.action_feature_names,
+    fps=30, stop_event=stop,
+)
+raw, _, _ = io.capture(0.2)
+rollout.begin_episode(prepare(raw), episode_id=0)
+transition = rollout.collect_window(step, use_actor=False)  # Initial VLA/reference collection.
+replay.save("outputs/piper_rlt_replay.pt")
+```
+
+`RobotWindowStep` validates the checkpoint/robot action order and records the
+return value of `io.send`, followed by a fresh post-command observation and its
+reward. It does not connect, reset or home hardware. Call it once per policy
+interval; applications with their own interpolation or human correction return
+one `ExecutedStep` with the actual command and reward for that policy interval.
+The bridge passes a stop signal and a command deadline bounded by
+`max_observation_age_s`. RobotIO and DaggerRobotIO check these after acquiring the
+motor lock, immediately before the driver write. This rejects queued commands;
+it cannot undo a write the driver has already started.
+An episode end requires an application reset and a new `begin_episode` call.
+After training and evaluating actor weights, `use_actor=True` selects that actor
+for the next full window. Do not run this collector alongside another controller
+that owns the same arm.
+
+**Train the small learner from collected replay**, without loading VLA weights
+or opening any robot connection:
+
+```bash
+python examples/tutorial/pi05/train_rlt_stage2.py \
+    --replay outputs/piper_rlt_replay.pt \
+    --output-dir outputs/piper_rlt_stage2_0001 \
+    --device cuda --steps 1000 --batch-size 256
+
+python examples/tutorial/pi05/train_rlt_stage2.py \
+    --resume outputs/piper_rlt_stage2_0001 \
+    --output-dir outputs/piper_rlt_stage2_0002 \
+    --device cuda --steps 1000 --batch-size 256
+```
+
+`steps` counts additional learner updates. Output directories must be new. Small
+actor/critic heads train in FP32 independently of the VLA precision profile and
+outer AMP. Checkpoints include actor weights/config, critics and targets, both
+optimizers, update step, replay ring and sampling RNG, and Python/Torch RNG.
+Replay v2 saves a complete `planned_action` separately from the actual executed
+`action` receipts. The critic always values a full K-step action: actual sent
+rows replace the plan's executed prefix, and unexecuted planned rows remain
+context only. Realized duration is used for rewards, discounting and BC masks;
+it is not an input to Q. This keeps short successful windows and full-window
+TD backups in the same value-function domain. Unexecuted receipt/reward tails
+remain zero padded.
+
+Legacy v1 replay containing only complete windows upgrades automatically. Old
+partial windows lack their unexecuted plan and must be recollected. The earlier
+critics/optimizer checkpoints cannot resume this corrected critic layout; retain
+the actor through an explicit warm start with compatible replay:
+
+```bash
+python examples/tutorial/pi05/train_rlt_stage2.py \
+    --replay outputs/new_rlt_replay.pt \
+    --actor-checkpoint outputs/old_rlt_checkpoint/actor \
+    --output-dir outputs/rlt_corrected_0001 --device cuda --steps 1000
+```
+
+This starts fresh critics/optimizers and preserves the saved actor dimensions
+and exploration settings. Corrected v2 checkpoints resume normally using
+`--resume`.
+Actor checkpoint loading is strict: missing or foreign tensors abort resume
+before optimizer restoration. Replay stores latent features and actions, not
+camera images. `algorithm.get_weights()`
+returns an actor-only payload with feature identity and learner version. The
+single rollout owner calls `rollout.load_actor_weights(algorithm.get_weights())`
+between windows; this checks the complete snapshot before replacing parameters,
+rejects stale versions and records the loaded version in replay. Calls made
+during a window are rejected. This implementation does not
+add a distributed actor-weight/reward RPC service or an automatic online learner
+to the ordinary RTC server.
+
+Validation uses real miniature PI05/RLT networks, actual `RLTrainer` updates,
+per-step rewards/masks, relative-action round trips, cancellation/reset fencing,
+and exact checkpoint resume. It verifies software contracts, not Piper task
+success or full-size inference latency. This is a local RLT implementation;
+native RLinf Stage 2 MLP checkpoints are not interchangeable with its parameter
+layout, and sharded Stage 2 training is not validated.
+
+### Stage 3: RLT with overlapping remote RTC execution
+
+This opt-in mode uses the existing `policy_server_deployment` and
+`robot_client_deployment` entrypoints. Ordinary deployment and its JSON settings
+keep their current behavior when `rlt.enabled=false` (the default). DAgger,
+ReCAP, trained RTC and distributed online learner/weight broadcasts are not
+part of this mode. Training remains the replay CLI described below.
+
+**Execution contract.** Each nonterminal replay window still contains **10 policy
+actions**, independently of motor interpolation. With `rlt.prefix_steps=3`, the
+next boundary observation is captured after action 10. The client uploads that
+observation and the previous window's actual command/reward receipts, then
+executes 3 already committed continuation rows while the server computes the
+new reference, RLT feature and actor output. The new result must arrive within
+the 3-step budget. The client uses its remaining 7 rows to finish the window.
+
+The continuation is the frozen VLA reference's `[10:13]` tail from the previous
+plan. It is **not an additional actor prediction**. When loaded, the actor owns
+7 new rows per steady-state window and all 10 rows of the cold first window.
+Without an actor, those rows use the frozen VLA reference. The handover from an
+actor to a VLA continuation needs task evaluation. Changing `prefix_steps`
+changes this tradeoff. This is a local RLT
+RTC adaptation, not a claim of identical upstream RLinf online RTC semantics.
+
+The state gains `observation.rtc_prefix` and `observation.rtc_prefix_mask`.
+The actor clamps committed rows and receives that context; the critic also
+sees the reference that determines the next continuation. Actor Q/BC updates
+exclude committed rows, and a batch containing only such rows skips the actor
+update. Replay uses actual reported commands in the **original window's**
+normalization and relative-action coordinates. Each window owns a coordinate
+snapshot, so the next inference cannot overwrite its anchor. A boundary's
+state is shared exactly by the preceding transition's next state and the
+following transition's current state. Termination and truncation stay distinct.
+
+The server uses the tokenizer/normalization assets bundled in the Stage 1
+checkpoint. The Stage 1 checkpoint must be full/merged RLinf PI05 with RLT,
+and must save `action_feature_names` in robot action order. Its chunk must cover
+`execution_horizon + prefix_steps`. RLT retains the saved numerical profile;
+the deployment compile flag/mode control compilation. Features and reference
+share one VLM prefix pass, and guided RTC conditions the reference on the
+committed absolute prefix after reanchoring to the new observation.
+
+Startup performs two motion-free dry warmups and at least one measured dry
+request, including the continuation path. No dry request enters replay. The
+maximum measured round trip must fit `prefix_steps / fps - budget_margin_s`.
+At 30 Hz and 3 steps the default budget is 95 ms. If it does not fit, reduce
+latency, increase `prefix_steps` while keeping it below 10, or lower both
+client/server policy fps. A live overrun aborts execution at the committed
+prefix; the client never extends it or silently replays a partial window.
+Before each prefix policy step starts, the client checks for an already completed
+inference failure and aborts the remaining policy steps. This check does not run
+inside motor interpolation substeps: a failure arriving during a policy step is
+handled before the next policy step starts. The cold
+first plan must start within `observation_max_age_s` measured from the oldest
+initial sensor timestamp, including inference and motor-lock waiting; expiry
+rejects actuation even if the RPC request timeout has not elapsed.
+Final-state encoding after a real task boundary waits without sending more
+commands. Reset fences the generation, drops unfinished data and keeps the
+existing planned Piper reset/homing path. Delayed results cannot actuate the
+next episode. Task changes require ending/resetting the RLT rollout first.
+
+For example, add these **overrides to the current deployment configuration**:
+
+```bash
+# Inference server; paths are on this host. Omit actor_checkpoint initially
+# to collect frozen-VLA reference rollouts; no randomly initialized actor executes.
+python -m lerobot.async_inference.server.policy_server_deployment \
+  --config_path=src/lerobot/async_inference/config/policy_server_deployment.json \
+  --rlt.enabled=true --rlt.execution_horizon=10 --rlt.prefix_steps=3 \
+  --rlt.replay_dir=outputs/piper_rlt_rtc \
+  --rlt.actor_checkpoint=/server/checkpoints/rlt_rtc/actor
+
+# Robot client; pretrained_name_or_path is the Stage 1 path ON THE SERVER.
+# Keep the existing Piper, cameras, task, fps and interpolation settings.
+python -m lerobot.async_inference.client.robot_client_deployment \
+  --config_path=src/lerobot/async_inference/config/robot_client_deployment.json \
+  --pretrained_name_or_path=/server/checkpoints/pi05_rlt_stage1 \
+  --rlt.enabled=true --rlt.execution_horizon=10 --rlt.prefix_steps=3 \
+  --rlt.reward_provider=manual
+```
+
+The RLT `prefix_steps` setting is independent of ordinary `rtc.execution_horizon`
+(which may currently be 20). Both sides must use the same RLT window/prefix and
+policy fps. Current server/client configurations must use `rtc.mode=guided` /
+`rtc_mode=guided` for RLT. The saved Stage 1 numerical profile is used directly;
+ordinary `pi05_inference.profile` overrides are not applied to frozen features.
+
+With `reward_provider=manual`, `/start` begins an episode; `/success` supplies
+reward 1 and termination, `/failure` supplies reward 0 and termination, and
+`/truncate` supplies reward 0 and time-limit truncation. Other executed
+intervals get reward 0. Feedback is consumed on a policy interval; `/reset`
+discards unfinished data rather than inventing a success or failure label.
+A task-specific callback can instead be configured as `module:function`; it
+receives `(raw_post_step_observation, actual_absolute_command)` and returns
+`lerobot.rl.rlt.rollout.RewardSignal`. Import/validation happens before robot
+connection. The robot must report its actual sent command; a missing report
+is an error. Built-in human takeover/DAgger control is not connected here.
+
+The server atomically journals **completed windows** to
+`outputs/piper_rlt_rtc/<session_uuid>/g..._s....pt`. Saving one small shard at a
+time avoids serializing the entire live ring on every refill. Use one session
+directory (or a normal replay file) with the same learner:
+
+```bash
+python examples/tutorial/pi05/train_rlt_stage2.py \
+  --replay outputs/piper_rlt_rtc/SESSION_UUID \
+  --output-dir outputs/rlt_rtc_0001 --device cuda --steps 1000 --batch-size 256
+
+python examples/tutorial/pi05/train_rlt_stage2.py \
+  --resume outputs/rlt_rtc_0001 \
+  --output-dir outputs/rlt_rtc_0002 --device cuda --steps 1000 --batch-size 256
+```
+
+Load the resulting `outputs/rlt_rtc_0002/actor` on the next deployment run and
+set `rlt.actor_version` to identify its learner version in new replay. The new
+RTC actor has additional inputs and its replay includes a distinct
+`rtc_prefix_steps` specification. Stage 2 replay/full optimizer checkpoints
+cannot be resumed as RTC data. An existing matching Stage 2 actor can be used
+for explicit **policy-only** initialization by adding
+`--rlt.warmstart_stage2_actor=true` on the server. Its existing weights are
+copied and the appended first-layer input columns start at zero; RTC
+critics/optimizers still start fresh. RTC checkpoints resume normally with
+their RTC replay specification. Native upstream Stage 2 weights are not
+interchangeable with this local actor layout.
+
+Validation includes real local gRPC client/server execution with a mock robot,
+policy-versus-motor step counts, actual receipt alignment, late inference,
+reset while waiting for motor ownership, journal training/resume, miniature
+PI05/RLT guided-sampler parity and CUDA Inductor compilation. It does not
+establish Piper task success or full-model latency on the target server.
 
 ### Synchronizing these changes to a training or inference server
 
@@ -433,6 +752,10 @@ server uses the same baseline, synchronize the following paths together:
 | `src/lerobot/policies/pi05/rlinf/` (the complete directory, including `LICENSE` and `README.md`) | Native RLinf network, conversion and custom LoRA layers |
 | `examples/tutorial/pi05/merge_lora.py`, `examples/tutorial/pi05/compare_backends.py` | Merged deployment export and backend comparison |
 | `examples/tutorial/pi05/export_rlt.py`, `tests/policies/pi0_pi05/test_pi05_rlt.py` | RLT encoder export and Stage 1 lifecycle validation |
+| `src/lerobot/policies/rlt_actor/`, `src/lerobot/policies/__init__.py`, `src/lerobot/rl/algorithms/rlt_ac/`, `src/lerobot/rl/algorithms/{__init__,factory}.py`, `src/lerobot/rl/rlt/` | Stage 2 actor registration, Q/BC learner, frozen-feature adapter and fixed-window replay |
+| `examples/tutorial/pi05/train_rlt_stage2.py`, `tests/rl/test_rlt_*.py`, `tests/policies/pi0_pi05/test_pi05_rlt_stage2.py` | Latent replay training/resume entrypoint and Stage 2 validation |
+| `src/lerobot/async_inference/{server/policy_server_deployment,client/robot_client_deployment,server/rlt_runtime,client/rlt_runtime,shared/rlt_config,shared/rlt_remote}.py`, `src/lerobot/rl/rlt/rtc.py` | Stage 3 opt-in RLT remote overlap, committed-prefix state and actual-command receipts |
+| `src/lerobot/async_inference_local/control/{robot_io,dagger_io}.py`, `tests/async_inference_local/test_robot_io.py` | Check cancellation and command expiry after waiting for motor I/O |
 | `pyproject.toml` | Include the vendored license and provenance in built packages |
 | `tests/policies/pi0_pi05/test_pi05_peft.py`, `tests/policies/pi0_pi05/test_pi05_rlinf.py`, `tests/policies/pi0_pi05/test_pi05_tokenizer.py`, `docs/source/pi05.mdx` | Regression tests and usage documentation |
 
@@ -440,7 +763,8 @@ The RLinf directory is required when `backend=rlinf`, including for merged
 inference checkpoints. There is no separate RLinf checkout to install. Servers
 on a different baseline need the matching fork changes integrated first; copying
 only the model implementation onto an arbitrary LeRobot release is insufficient.
-No Piper driver, RTC transport or robot client change is introduced by this update.
+The collector uses the optional cancellation/deadline guards in shared RobotIO.
+Preserve the existing Piper driver and RTC deployment configuration.
 The update contains changed files only. Preserve the rest of the existing
 checkout, including `src/lerobot/policies/__init__.py`, which exports
 `PreTrainedPolicy` and the policy factory. Do not replace the whole `policies/`

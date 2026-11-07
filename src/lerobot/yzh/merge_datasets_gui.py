@@ -3,10 +3,10 @@
 
 """Linux desktop picker for merging local LeRobot datasets.
 
-Run this script with the Python environment that has ``lerobot[dataset]`` installed.
-When ``zenity`` is installed (the default on most Linux desktops), the script
-uses GTK dialogs so text remains antialiased even when the Conda Tk build has
-been compiled without Xft. Set ``LEROBOT_GUI_BACKEND=tk`` to use the Tk window.
+Run ``uv run --no-sync python src/lerobot/yzh/merge_datasets_gui.py`` with the
+``dataset`` and ``desktop`` extras installed. The default Qt window shares the
+GitHub upload tool's dark palette and antialiased Chinese text. The older GTK
+and Tk interfaces remain available through ``LEROBOT_GUI_BACKEND=zenity|tk``.
 The selected folders are passed to the existing ``lerobot-edit-dataset`` merge
 operation via ``--operation.roots``; no dataset is uploaded to the Hub.
 When mixing demonstrations and DAgger datasets, missing ``intervention`` flags
@@ -15,6 +15,7 @@ are filled with ``False`` in the output; existing flags are preserved.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import queue
@@ -25,10 +26,15 @@ import signal
 import subprocess
 import sys
 import threading
-import tkinter as tk
 from contextlib import suppress
 from pathlib import Path
-from tkinter import filedialog, font as tkfont, messagebox, scrolledtext, ttk
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, font as tkfont, messagebox, scrolledtext, ttk
+except ImportError:
+    # The Qt window and command-building helpers do not require a Tk installation.
+    tk = None
 
 
 def find_project_root() -> Path:
@@ -43,6 +49,17 @@ def find_project_root() -> Path:
 PROJECT_ROOT = find_project_root()
 REPO_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 REPO_COMPONENT_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+
+
+def subprocess_environment(project_root: Path | None = None) -> dict[str, str]:
+    """Keep user settings while excluding foreign Python and shared-library paths."""
+    environment = os.environ.copy()
+    for name in ("PYTHONHOME", "PYTHONPATH", "LD_LIBRARY_PATH", "LD_PRELOAD"):
+        environment.pop(name, None)
+    environment["PYTHONNOUSERSITE"] = "1"
+    if project_root is not None:
+        environment["PYTHONPATH"] = str(project_root / "src")
+    return environment
 
 
 def lerobot_home() -> Path:
@@ -287,6 +304,7 @@ def zenity_call(args: list[str], *, input_text: str | None = None) -> tuple[int,
     """Run a Zenity dialog and return its exit code and text output."""
     completed = subprocess.run(
         ["zenity", *args],
+        env=subprocess_environment(),
         input=input_text,
         capture_output=True,
         text=True,
@@ -367,9 +385,7 @@ def zenity_choose_datasets(paths: list[Path], home: Path) -> list[Path] | None:
 
 def run_merge_with_zenity(command: list[str], output_dir: Path, project_root: Path) -> int:
     """Run merge with a clear GTK progress window and a scrollable log."""
-    env = os.environ.copy()
-    src = str(project_root / "src")
-    env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    env = subprocess_environment(project_root)
     logs: list[str] = []
     progress = None
     try:
@@ -383,6 +399,7 @@ def run_merge_with_zenity(command: list[str], output_dir: Path, project_root: Pa
                 "--text=正在准备合并，请稍候…",
                 "--width=620",
             ],
+            env=subprocess_environment(),
             stdin=subprocess.PIPE,
             text=True,
         )
@@ -734,9 +751,7 @@ class MergeDatasetGui:
         threading.Thread(target=self.run_merge, args=(command,), daemon=True).start()
 
     def run_merge(self, command: list[str]) -> None:
-        env = os.environ.copy()
-        src = str(PROJECT_ROOT / "src")
-        env["PYTHONPATH"] = src + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+        env = subprocess_environment(PROJECT_ROOT)
         try:
             with subprocess.Popen(
                 command,
@@ -819,12 +834,44 @@ class MergeDatasetGui:
 
 
 def main() -> None:
-    backend = os.environ.get("LEROBOT_GUI_BACKEND", "auto").strip().lower()
-    if backend not in {"auto", "tk", "zenity"}:
-        raise ValueError("LEROBOT_GUI_BACKEND 必须是 auto、tk 或 zenity")
+    parser = argparse.ArgumentParser(description="LeRobot 本地数据集合并 · 深色桌面面板")
+    parser.add_argument("--source", type=Path, help="启动时扫描的源数据父目录（Qt 界面）")
+    parser.add_argument("--demo", action="store_true", help="预览示例界面，不读取或合并真实数据")
+    parser.add_argument(
+        "--backend",
+        choices=("auto", "qt", "tk", "zenity"),
+        default=os.environ.get("LEROBOT_GUI_BACKEND", "auto").strip().lower(),
+        help="auto 默认使用 Qt，未安装 Qt 时使用兼容界面",
+    )
+    args = parser.parse_args()
+    backend = args.backend
+    if backend not in {"auto", "qt", "tk", "zenity"}:
+        parser.error("LEROBOT_GUI_BACKEND 必须是 auto、qt、tk 或 zenity")
+    if (args.source or args.demo) and backend in {"tk", "zenity"}:
+        parser.error("--source 和 --demo 需要 Qt 界面")
+    if backend in {"auto", "qt"}:
+        try:
+            if __package__:
+                from .merge_datasets_window import launch
+            else:
+                from merge_datasets_window import launch
+        except ImportError as exc:
+            if not (exc.name or "").startswith("PyQt5"):
+                raise
+            if backend == "qt" or args.source or args.demo:
+                parser.exit(
+                    1,
+                    "Qt 界面需要 desktop extra，请先执行 uv sync --locked --inexact --extra dataset --extra desktop\n",
+                )
+            print("未安装 PyQt5，正在使用兼容界面。", file=sys.stderr)
+        else:
+            launch(source=args.source, demo=args.demo)
+            return
     if backend == "zenity" or (backend == "auto" and shutil.which("zenity")):
         run_zenity_gui()
         return
+    if tk is None:
+        parser.exit(1, "当前环境没有 Tk，请安装 desktop extra 后使用 Qt 界面。\n")
     root = tk.Tk()
     MergeDatasetGui(root)
     root.mainloop()

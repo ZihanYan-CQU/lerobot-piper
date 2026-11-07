@@ -105,6 +105,7 @@ from ..shared.image_transport import (
     encode_observation_images,
     parse_image_transport_metadata,
 )
+from ..shared.rlt_config import RLTClientConfig
 from ..shared.rtc_remote import (
     DEPLOYMENT_RTC_PROTOCOL_VERSION,
     ROLLOUT_SEQUENCE_LIMIT,
@@ -1273,11 +1274,12 @@ class _InterpolatedClient(_RTCClient):
                 return None
 
             policy_action = scheduled.timed_action
+            action = policy_action.get_action().detach().cpu()
             self._interpolation_substep = 0
             self._interpolation_substeps = (
                 self.action_interpolator.multiplier if self._has_interpolation_origin else 1
             )
-            self.action_interpolator.add(policy_action.get_action().detach().cpu())
+            self.action_interpolator.add(action)
             self._has_interpolation_origin = True
         else:
             scheduled = self.action_schedule.inflight()
@@ -1387,6 +1389,8 @@ class _RequestTiming:
 @dataclass
 class RobotClientDeploymentConfig(_InterpolatedClientConfig):
     """Interpolated RTC settings plus reusable rollout reset."""
+
+    rlt: RLTClientConfig = field(default_factory=RLTClientConfig)
 
     disable_proxy: bool = field(
         default=False,
@@ -1527,6 +1531,13 @@ class RobotClientDeploymentConfig(_InterpolatedClientConfig):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if self.rlt.enabled:
+            if self.policy_type != "pi05" or self.rtc_mode != "guided":
+                raise ValueError("RLT deployment currently requires guided PI05")
+            if self.rlt.budget_margin_s >= self.rlt.prefix_steps / self.fps:
+                raise ValueError("RLT timing margin must be smaller than the committed prefix duration")
+            if self.actions_per_chunk < self.rlt.execution_horizon + self.rlt.prefix_steps:
+                raise ValueError("RLT actions_per_chunk must cover the window and its continuation prefix")
         if self.startup_calibration_runs < 0:
             raise ValueError("startup_calibration_runs must be non-negative")
         for name in ("startup_calibration_timeout_s", "latency_history_ttl_s"):
@@ -1609,6 +1620,17 @@ class RobotClientDeployment(_InterpolatedClient):
     logger = get_logger(prefix)
 
     def __init__(self, config: RobotClientDeploymentConfig):
+        self._rlt_runtime = None
+        rlt_config = getattr(config, "rlt", None)
+        rlt_reward = None
+        if rlt_config is not None and rlt_config.enabled:
+            if self.prefix != "robot_client_deployment":
+                raise ValueError("RLT currently supports robot_client_deployment only")
+            from .rlt_runtime import load_reward_provider
+
+            if config.policy_type != "pi05" or config.rtc_mode != "guided":
+                raise ValueError("RLT deployment currently requires guided PI05")
+            rlt_reward = load_reward_provider(rlt_config.reward_provider)
         if config.disable_proxy:
             for name in ("http_proxy", "https_proxy", "all_proxy", "grpc_proxy"):
                 os.environ.pop(name, None)
@@ -1690,6 +1712,11 @@ class RobotClientDeployment(_InterpolatedClient):
                     exc,
                 )
 
+        if rlt_config is not None and rlt_config.enabled:
+            from .rlt_runtime import RemoteRLTClient
+
+            self._rlt_runtime = RemoteRLTClient(self, rlt_reward)
+
     # ------------------------------------------------------------------
     # Lifecycle API
     # ------------------------------------------------------------------
@@ -1726,11 +1753,19 @@ class RobotClientDeployment(_InterpolatedClient):
             if self._rollout_state is RolloutState.STOPPED:
                 return False
             changed = task != self._task
+            if (
+                changed
+                and getattr(self, "_rlt_runtime", None) is not None
+                and self._rollout_state is RolloutState.RUNNING
+            ):
+                return False
             self._task = task
             return changed
 
     def start(self) -> bool:
         """Finish dry calibration before any execution/recording threads start."""
+        if getattr(self, "_rlt_runtime", None) is not None:
+            return self._rlt_runtime.start()
         with self._lifecycle_lock:
             if self._rollout_state is not RolloutState.READY or self._startup_in_progress.is_set():
                 return False
@@ -1881,6 +1916,8 @@ class RobotClientDeployment(_InterpolatedClient):
             self._clear_episode_state_locked()
             if task is not None:
                 self._task = task
+            if self._rlt_runtime is not None:
+                self._rlt_runtime.begin_rollout()
             self._rollout_state = RolloutState.RUNNING
             generation = self._rollout_generation
             current_task = self._task
@@ -1970,6 +2007,8 @@ class RobotClientDeployment(_InterpolatedClient):
         collector = self._observation_collector
         if collector is not None and collector is not threading.current_thread():
             collector.join(timeout=3)
+        if getattr(self, "_rlt_runtime", None) is not None:
+            self._rlt_runtime.close()
 
     def _advance_generation_locked(self) -> None:
         self._rollout_generation += 1
@@ -1994,6 +2033,8 @@ class RobotClientDeployment(_InterpolatedClient):
     def _clear_episode_state_locked(self) -> None:
         """Clear every client state that can carry policy history across a reset."""
 
+        if getattr(self, "_rlt_runtime", None) is not None:
+            self._rlt_runtime.cancel()
         self._latest_observation = None
         self._last_used_observation_sequence = -1
         self._observation_valid_after = time.monotonic()
@@ -2064,6 +2105,11 @@ class RobotClientDeployment(_InterpolatedClient):
         with self._observation_capture_lock:
             return self._read_action_pose_unlocked()
 
+    def _send_reset_action(self, action: dict[str, float]) -> dict[str, float]:
+        """Use planned positioning when the robot exposes a reset-specific entrypoint."""
+        planned = getattr(self.robot, "send_action_planned", None)
+        return planned(action) if callable(planned) else self.robot.send_action(action)
+
     def _reset_robot_pose(self) -> bool:
         try:
             with self._observation_capture_lock, self._robot_command_lock:
@@ -2103,7 +2149,7 @@ class RobotClientDeployment(_InterpolatedClient):
                         return False
                     ratio = step / steps
                     command = {key: current[key] * (1.0 - ratio) + target[key] * ratio for key in target}
-                    self.robot.send_action(command)
+                    self._send_reset_action(command)
                     if self.config.reset_duration_s:
                         precise_sleep(1.0 / self.config.reset_fps)
                 # A loaded gripper can drift slightly from its measured hold
@@ -2136,9 +2182,9 @@ class RobotClientDeployment(_InterpolatedClient):
         while time.monotonic() < deadline:
             if self._reset_cancelled():
                 return False
-            # Continue advancing any robot-side command smoothing toward the
-            # target. Successful send_action alone is never proof of arrival.
-            self.robot.send_action(target)
+            # Refresh the planned target while checking measured arrival.
+            # A successful send alone is never proof of arrival.
+            self._send_reset_action(target)
             poses = self._read_reset_poses_unlocked(max(0.0, deadline - time.monotonic()))
             if not poses:
                 raise RuntimeError("reset feedback contains no robot poses")
@@ -3238,7 +3284,16 @@ def _interactive_prompt(client: RobotClientDeployment) -> None:
         command, _, arguments = line.partition(" ")
         command = command.lower()
         arguments = arguments.strip()
-        if command == "/start":
+        if (
+            command in {"/success", "/failure", "/truncate"}
+            and getattr(client, "_rlt_runtime", None) is not None
+        ):
+            runtime = client._rlt_runtime
+            if runtime.mark_manual_outcome(command.removeprefix("/")):
+                print("RLT task outcome queued for the current policy interval", flush=True)
+            else:
+                print("Manual RLT feedback requires a running rollout and reward_provider=manual", flush=True)
+        elif command == "/start":
             if client.start_rollout(arguments or None):
                 print(f"started: {_render_status(client)}", flush=True)
             else:
@@ -3265,7 +3320,8 @@ def _interactive_prompt(client: RobotClientDeployment) -> None:
                 "/task <task>   change the instruction used by future observations\n"
                 "/reset         stop, clear the episode, and return/hold the robot\n"
                 "/status        show lifecycle and schedule progress\n"
-                "/stop          disconnect and end the client",
+                "/stop          disconnect and end the client\n"
+                "/success /failure /truncate  finish an RLT rollout with manual task feedback",
                 flush=True,
             )
         elif command == "/stop":
@@ -3286,23 +3342,26 @@ def async_client(cfg: RobotClientDeploymentConfig) -> None:
         client.stop()
         return
 
-    threads = [
-        threading.Thread(
-            target=client.receive_actions,
-            daemon=True,
-            name="RTCActionReceiver",
-        ),
-        threading.Thread(
-            target=client.observation_sender,
-            daemon=True,
-            name="RTCObservationSender",
-        ),
-        threading.Thread(
-            target=client.control_loop,
-            daemon=True,
-            name="RTCLocalControl",
-        ),
-    ]
+    if client._rlt_runtime is not None:
+        threads = [threading.Thread(target=client._rlt_runtime.run, daemon=True, name="RLTLocalControl")]
+    else:
+        threads = [
+            threading.Thread(
+                target=client.receive_actions,
+                daemon=True,
+                name="RTCActionReceiver",
+            ),
+            threading.Thread(
+                target=client.observation_sender,
+                daemon=True,
+                name="RTCObservationSender",
+            ),
+            threading.Thread(
+                target=client.control_loop,
+                daemon=True,
+                name="RTCLocalControl",
+            ),
+        ]
     for thread in threads:
         thread.start()
 

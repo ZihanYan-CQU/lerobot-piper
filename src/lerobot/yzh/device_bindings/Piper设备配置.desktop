@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Piper 设备配置
+Comment=配置和检查相机别名、机械臂 CAN 接口
+Exec=/usr/bin/python3 "/home/cpy/桌面/yzh/piper/lerobot/src/lerobot/yzh/device_bindings/camera_aliases_gui.py"
+TryExec=/usr/bin/python3
+Icon=camera-photo
+Terminal=false
+StartupNotify=true
+Categories=Settings;HardwareSettings;
+X-LeRobot-DeviceBindings=true

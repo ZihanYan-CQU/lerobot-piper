@@ -1,169 +1,19 @@
-#查找机械臂设备号
-bash find_all_can_port.sh
-根据设备号进行分配主从臂：右边为主臂，左边为从臂（一般右边数字>左边）
-bash can_activate.sh can_master 1000000 "1-10.2:1.0"
-bash can_activate.sh can_follower 1000000 "1-10.3:1.0"
-guvcview --device=/dev/video_top 查看相机连接绑定情况
-guvcview --device=/dev/video_wrist 查看相机连接绑定情况
-ls -l /dev/video* 查看相机连接绑定情况
-ffplay /dev/video4 查看相机画面及具体情况
-udevadm info --query=path --name=/dev/video4 查看相机设备号
-在目录 计算机/etc/udev/rules.d/99-cameras.rules里编辑KERNELS参数改为对应相机设备号，使相机与设备号一一对应
-sudo udevadm control --reload-rules 重新加载
-sudo udevadm trigger
-lerobot-teleoperate \
-  --robot.type=piper_follower \
-  --robot.id=my_follower_arm \
-  --robot.cameras='{
-    "top": {
-      "type": "opencv",
-      "index_or_path": "/dev/video_top",
-      "width": 640,
-      "height": 480,
-      "fps": 30,
-      "rotation": 0
-    },
-    "wrist": {
-      "type": "opencv",
-      "index_or_path": "/dev/video_wrist",
-      "width": 640,
-      "height": 480,
-      "fps": 30,
-      "rotation": 180
-    }
-  }' \
-  --teleop.type=piper_leader \
-  --teleop.id=my_leader_arm \
-  --display_data=true \
-  --fps=30
-  
-lerobot-record \
-  --robot.type=piper_follower \
-  --robot.cameras='{
-    "top": {
-      "type": "opencv",
-      "index_or_path": "/dev/video_top",
-      "width": 640,
-      "height": 480,
-      "fps": 30,
-      "rotation": 0
-    },
-    "wrist": {
-      "type": "opencv",
-      "index_or_path": "/dev/video_wrist",
-      "width": 640,
-      "height": 480,
-      "fps": 30,
-      "rotation": 180
-    }
-  }' \
-  --teleop.type=piper_leader \
-  --display_data=true \
-  --dataset.reset_time_s=30 \
-  --dataset.repo_id=take_storage/storage_binder \
-  --dataset.push_to_hub=false \
-  --dataset.num_episodes=50 \
-  --dataset.single_task="Put the long tail binder clips on the desk back into their box." \
-  --dataset.fps=30
-  
-lerobot-record \
-  --robot.type=piper_follower \
-  --robot.cameras='{
-    "top": {
-      "type": "opencv",
-      "index_or_path": "/dev/video_top",
-      "width": 640,
-      "height": 480,
-      "fps": 30,
-      "rotation": 0
-    },
-    "wrist": {
-      "type": "opencv",
-      "index_or_path": "/dev/video_wrist",
-      "width": 640,
-      "height": 480,
-      "fps": 30,
-      "rotation": 180
-    }
-  }' \
-  --teleop.type=piper_leader \
-  --display_data=true \
-  --dataset.episode_time_s=90 \
-  --dataset.reset_time_s=30 \
-  --dataset.repo_id=block/shape-matching \
-  --dataset.push_to_hub=false \
-  --dataset.num_episodes=10 \
-  --dataset.single_task="Place the block on the shape-matching board." \
-  --dataset.fps=30
-  
-python src/lerobot/scripts/lerobot_dataset_viz.py \
-  --repo-id block/shape-matching_10 \
-  --episode-index 0
-  
-lerobot-edit-dataset \
-  --new_repo_id block/shape-matching_89 \
-  --operation.type merge \
-  --operation.repo_ids "['block/shape-matching_0-10', 'block/shape-matching_10-20', 'block/shape-matching_20-30', 'block/shape-matching_30-40', 'block/shape-matching_40-50', 'block/shape-matching_50-60', 'block/shape-matching_60-70', 'block/shape-matching_70-80_filtered', 'block/shape-matching_80-90']" \
-  --push_to_hub false
-  
-lerobot-edit-dataset \
-  --repo_id block/shape-matching_70-80 \
-  --new_repo_id block/shape-matching_70-80_filtered \
-  --operation.type delete_episodes \
-  --operation.episode_indices "[4]" \
-  --push_to_hub false
+Piper 旧指令笔记已按流程迁移；本文件仅保留旧入口导航，不再维护重复命令。
 
-hf upload sukasu403/shape-matching_89_with_dagger_30 ~/.cache/huggingface/lerobot/block/shape-matching_89_with_dagger_30 \
-  --repo-type dataset \
-  --revision "v1.0" 
-  
-hf download sukasu403/dagger_merged \
-  --local-dir /home/yzh/具身智能/训练数据/dagger_merged \
-  --repo-type dataset \
-  --revision v1.0
+统一入口：docs/README.md
 
-  
-python /mnt/data/YZH/piper_lerobot/src/lerobot/scripts/lerobot_train.py\
-    --dataset.repo_id=sukasu403/shape-matching_89 \
-    --policy.type=pi05 \
-    --output_dir=/mnt/data/YZH/具身智能/VLA_model \
-    --job_name=pi05_training \
-    --policy.repo_id=sukasu403/pi05 \
-    --policy.pretrained_path=lerobot/pi05_base \
-    --policy.compile_model=true \
-    --policy.gradient_checkpointing=true \
-    --wandb.enable=false \
-    --policy.dtype=bfloat16 \
-    --steps=1 \
-    --policy.device=cuda \
-    --batch_size=32
+环境与迁移：docs/workflows/setup/README.md
+设备 / 相机 / CAN 绑定：docs/workflows/tools/device-bindings.md
+遥操作与演示数采：docs/workflows/recording/README.md
+数据可视化、过滤、合并、上传下载：docs/workflows/datasets/README.md
+Pi0.5 训练：docs/workflows/training/README.md
+真机部署：docs/workflows/deployment/README.md
+DAgger 接管数采：docs/workflows/dagger/README.md
+指示灯作用与配置：docs/workflows/tools/status-indicator.md
+MuJoCo 仿真：docs/workflows/simulation/README.md
+RLT 训练与导出：docs/workflows/rlt/README.md
+辅助工具：docs/workflows/tools/README.md
+问题记录与排错：docs/troubleshooting/README.md
+代码架构：docs/architecture/README.md
 
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6
-torchrun --nproc-per-node=4 $(which lerobot-train) \
-    --job_name=pi05_training \
-    --parallelism.dp_shard=4 \
-    --accelerator.mixed_precision=bf16 \
-    --dataset.repo_id=sukasu403/shape-matching_89 \
-    --dataset.root=/mnt/data/YZH/具身智能/训练数据/shape-matching_89 \
-    --policy.repo_id=sukasu403/pi05 \
-    --policy.type=pi05 \
-    --policy.pretrained_path=/mnt/data/YZH/具身智能/基座模型/pi05_base \
-    --policy.text_tokenizer_name=/mnt/data/YZH/具身智能/基座模型/paligemma-3b-pt-224 \
-    --policy.compile_model=false \
-    --policy.gradient_checkpointing=true \
-    --policy.device=cuda \
-    --policy.optimizer_lr=2.5e-5 \
-    --policy.dtype=bfloat16 \
-    --batch_size=2 \
-    --steps=5000 \
-    --save_freq=1000 \
-    --wandb.enable=true \
-    --output_dir=/mnt/data/YZH/具身智能/微调模型/pi0.5_shapeMatching > /mnt/data/YZH/具身智能/训练日志/training.log 2>&1 &
-
-cd /mnt/data/YZH/piper_lerobot
-CUDA_VISIBLE_DEVICES=1 python -m src.lerobot.async_inference.server.policy_server \
-    --host=127.0.0.1 \
-    --port=8080 \
-    --fps=30 \
-    --inference_latency=0.033 \
-    --obs_queue_timeout=1
+旧的绝对脚本路径、训练并行参数及通用 policy_server 入口请以新流程页为准。

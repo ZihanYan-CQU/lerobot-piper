@@ -51,7 +51,16 @@ def merge_adapter(
         raise ValueError("Expected a PI05 PEFT checkpoint with its saved LeRobot config and processors.")
     if rlt_encoder_only and not config.use_rlt:
         raise ValueError("rlt_encoder_only requires a checkpoint trained with use_rlt=True.")
-    config = replace(config, device=device, use_peft=False, compile_model=False, gradient_checkpointing=False)
+    # Preserve the adapter's saved tokenizer even if its original external path
+    # now points at different assets or is unavailable on this machine.
+    config = replace(
+        config,
+        device=device,
+        use_peft=False,
+        compile_model=False,
+        gradient_checkpointing=False,
+        text_tokenizer_name=None,
+    )
     peft_config = PeftConfig.from_pretrained(adapter, revision=revision)
     if not peft_config.base_model_name_or_path:
         raise ValueError("The adapter config must reference its pretrained base checkpoint.")

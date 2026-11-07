@@ -920,6 +920,29 @@ class PiperDaggerController:
             self._write_same_values(values)
             return self._action_dict(values)
 
+    def send_planned_action(self, action: dict[str, float]) -> dict[str, float]:
+        """Send reset waypoints through J mode on both arms, without shared EMA."""
+        with self._lock:
+            if self._closed or self._mode in (PiperControlMode.CORRECTING, PiperControlMode.CLOSED):
+                raise PiperDaggerHardwareError(f"planned command rejected in mode {self._mode.value}")
+            values = self._action_values(action)
+
+            def write_follower():
+                planned = getattr(self.follower_robot, "send_action_planned", None)
+                if callable(planned):
+                    planned(self._action_dict(values))
+                else:
+                    self.follower_bus.write(values)
+
+            if self.config.follower_first:
+                write_follower()
+                self.master_bus.write(values)
+            else:
+                self.master_bus.write(values)
+                write_follower()
+            self.seed_command(self._action_dict(values))
+            return self._action_dict(values)
+
     def pause_computer_output(self) -> None:
         """Close forwarding and align the master to the held follower pose."""
         with self._lock:

@@ -1,10 +1,12 @@
 # Evo-RL 前两轮 SFT：数据、训练参数及本项目差异
 
+[研究索引](README.md) · [本地训练实验](training-experiments.md) · [训练机制](../architecture/training.md)
+
 调研日期：2026-10-16。范围：首次专家示范 SFT，以及从该模型继续进行的「专家示范 + 人工干预」SFT。依据为论文、项目数据页关联的 Elvinky 公开模型、随模型发布的训练配置/复现补丁，以及本项目当前工作区源码。未进行实机效果验证。
 
 最值得本项目先对齐的，是**连续干预片段边界、时间 padding 的 loss mask、第二轮降低学习率，以及按干预池曝光量控制训练长度**。本项目已具备 1:1 起点采样；采样比例只是配方的一部分。
 
-同日实现更新：已接入 `policy.mask_action_padding_loss`，默认关闭、第二轮显式开启；默认标量 loss 对齐下述公开补丁的有效元素均值。LeRobot 原有的可选样本加权接口保留，但本轮配方明确使用 `sample_weighting=null`，没有新增 RA-BC 或干预 loss 权重。本地实际数据审计、训练命令、曝光步数和多次接管建议见 [训练 README 第 7、10–13 节](../../src/lerobot/yzh/README_TRAINING.md)。
+同日实现更新：已接入 `policy.mask_action_padding_loss`，默认关闭、第二轮显式开启；默认标量 loss 对齐下述公开补丁的有效元素均值。LeRobot 原有的可选样本加权接口保留，但本轮配方明确使用 `sample_weighting=null`，没有新增 RA-BC 或干预 loss 权重。本地实际数据审计、训练命令、曝光步数和多次接管建议见 [训练实验记录](training-experiments.md)与 [loss 机制](../architecture/training.md#10-loss-来源与-padding-mask)。
 
 ## 1. 先区分三类证据
 
@@ -143,7 +145,7 @@ loss = sum(loss_element[b,t,d] * valid[b,t])
 
 **论文成功过滤与公开 D3 构建存在证据缺口。** 论文要求成功轨迹；但 D3 的 `build.py` 抽取源数据里全部人工帧，没有显式 success 条件，源数据卡也明确结构验证不保证每条轨迹成功。因此不能声称该公开模型严格验证了论文的成功过滤。建议本项目依靠已有 RECAP outcome 做明确过滤，并记录过滤前后的数据规模。[D3 数据说明](https://huggingface.co/datasets/Elvinky/pi05-piperx-3h-demo-dagger-full-episodes-20260911)、[构建脚本](https://huggingface.co/Elvinky/pi05-piperx-3h-intervention-1to1-mask-8884s-seed1000-fp32/blob/c1898a9ff5b3350aefa7fd0a7cfcc0528498dae0/reproducibility/build.py)
 
-**项目指南原先引用的 35,999 步实验，第二个池并非纯干预。** 它混合 138,514 个人工帧和 322,261 个 value 筛选帧；全局 32 个原示范 + 32 个混合池样本。按帧均匀采样时，人工帧占全 batch 的期望约为 `0.5 × 138514 / 460775 = 15.03%`。该训练预算不能直接当作纯 50% 人工干预的 SFT2 配方。[35,999 步模型卡](https://huggingface.co/Elvinky/pi05-piperx-full558-intervention-value-1to1-step35999)、[本地引用位置](../../AGENT_GUIDE.md#L406)
+**项目指南原先引用的 35,999 步实验，第二个池并非纯干预。** 它混合 138,514 个人工帧和 322,261 个 value 筛选帧；全局 32 个原示范 + 32 个混合池样本。按帧均匀采样时，人工帧占全 batch 的期望约为 `0.5 × 138514 / 460775 = 15.03%`。该训练预算不能直接当作纯 50% 人工干预的 SFT2 配方。[35,999 步模型卡](https://huggingface.co/Elvinky/pi05-piperx-full558-intervention-value-1to1-step35999)。原引用位于整理前的 `AGENT_GUIDE.md` 第 406 行
 
 **1,511 步也不是这里的第二轮人工 SFT。** 同名公开 checkpoint 明确只使用 full558 原示范及其 value 筛选子集，没有人工干预；其预算是 0.15 个筛选池曝光 epoch。论文中的训练耗时描述与此公开记录的模型身份不能直接合并解释。[1,511 步模型记录](https://huggingface.co/Elvinky/pi05-piperx-full558-demo-value-1to1-step1511-seed1000/blob/064a19c3bc9d926f3c24bf7a39b2184347119554/README.md)
 

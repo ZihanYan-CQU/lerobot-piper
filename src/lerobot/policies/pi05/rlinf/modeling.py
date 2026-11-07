@@ -18,6 +18,7 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 
+from lerobot.policies.common.flow_matching import euler_integrate
 from lerobot.policies.common.vla_utils import make_att_2d_masks
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 
@@ -80,6 +81,7 @@ class RLinfPI05Pytorch(PI05Pytorch):
             # stay outside Dynamo, with separate prefix/suffix regions for the
             # native/reference guidance fallback.
             self._compiled_sample_actions = torch.compile(self._sample_actions, mode=config.compile_mode)
+            self._compiled_rlt_prefix = torch.compile(self.build_prefix_cache, mode=config.compile_mode)
             self._compiled_prefill_prefix = torch.compile(self._prefill_prefix, mode=config.compile_mode)
             self._compiled_denoise_step = torch.compile(self.denoise_step, mode=config.compile_mode)
             self.forward = torch.compile(self.forward, mode=config.compile_mode)
@@ -260,6 +262,43 @@ class RLinfPI05Pytorch(PI05Pytorch):
     def extract_rlt_features(self, images, img_masks, tokens, masks):
         prefix_output, padding, _ = self.build_prefix_cache(images, img_masks, tokens, masks)
         return self._rlt_forward(prefix_output, padding, tokens, mode="encode")
+
+    @torch.no_grad()
+    def sample_actions_with_rlt_features(
+        self, images, img_masks, tokens, masks, *, noise=None, num_steps=None,
+        prev_chunk_left_over=None, inference_delay=0, execution_horizon=None,
+    ):
+        """Extract z and a reference chunk from one observation-only prefix pass.
+
+        Optional guided RTC conditions the action expert on a committed prefix;
+        z still represents the same boundary observation. Suffix regions can be compiled.
+        """
+        if not self.config.use_rlt:
+            raise ValueError("RLT features require policy.use_rlt=True")
+        guided = prev_chunk_left_over is not None
+        if self._rtc_enabled() and self.rtc_processor.rtc_config.mode != "guided":
+            raise ValueError("Shared RLT sampling supports guided RTC only")
+        if guided and not self._rtc_enabled():
+            raise ValueError("Configure guided RTC before supplying a committed prefix")
+        num_steps = self.config.num_inference_steps if num_steps is None else num_steps
+        if isinstance(num_steps, bool) or not isinstance(num_steps, int) or num_steps < 1:
+            raise ValueError("num_steps must be a positive integer")
+        shape = (tokens.shape[0], self.config.chunk_size, self.config.max_action_dim)
+        if noise is None:
+            noise = self.sample_noise(shape, tokens.device)
+        if noise.shape != shape or not torch.isfinite(noise).all():
+            raise ValueError("Invalid reference chunk noise")
+        prefill = self._compiled_rlt_prefix if self.config.compile_model else self.build_prefix_cache
+        denoise = self._compiled_denoise_step if self.config.compile_model else self.denoise_step
+        prefix, padding, cache = prefill(images, img_masks, tokens, masks)
+        z = self._rlt_forward(prefix, padding, tokens, mode="encode")
+        actions = euler_integrate(
+            lambda x_t, timestep: denoise(padding, cache, x_t, timestep), noise, num_steps,
+            rtc_processor=self.rtc_processor, rtc_enabled=guided,
+            prev_chunk_left_over=prev_chunk_left_over,
+            inference_delay=inference_delay, execution_horizon=execution_horizon,
+        )
+        return actions, z
 
     def build_prefix_cache(self, images, img_masks, tokens, masks):
         prefix, padding, autoregressive = self.embed_prefix(images, img_masks, tokens, masks)

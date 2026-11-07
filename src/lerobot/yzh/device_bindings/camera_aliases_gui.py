@@ -3,20 +3,23 @@
 
 from __future__ import annotations
 
-import os
 import re
 import shutil
 import subprocess
 import sys
 import threading
-from pathlib import Path
+from datetime import datetime
 
 if __package__:
+    from . import binding_checks as checks
     from . import can_port_bindings as can
     from . import camera_aliases as core
+    from .privileged_session import PrivilegedSession
 else:
+    import binding_checks as checks
     import can_port_bindings as can
     import camera_aliases as core
+    from privileged_session import PrivilegedSession
 
 
 def saved_bindings(cameras: list[core.Camera]) -> list[tuple[str | None, str]]:
@@ -39,39 +42,154 @@ def saved_bindings(cameras: list[core.Camera]) -> list[tuple[str | None, str]]:
     return result
 
 
-def install_command(cameras: list[core.Camera], mappings: list[tuple[str, str]]) -> list[str]:
-    """Pass an identity snapshot to the installer and use the desktop authentication agent."""
+def camera_request(cameras: list[core.Camera], mappings: list[tuple[str, str]]) -> dict:
+    """Send explicit mappings and their device identities to the shared helper."""
     by_node = {camera.node: camera for camera in cameras}
-    command = ["/usr/bin/python3", str(Path(core.__file__).resolve())]
-    for node, alias in mappings:
-        command.extend(["--map", f"{node}={alias}"])
-    for node in sorted({node for node, _ in mappings}):
-        command.extend(["--expect-camera", f"{node}={core.identity_token(by_node[node])}"])
-    if os.geteuid() != 0:
-        pkexec = shutil.which("pkexec")
-        if pkexec is None:
-            raise RuntimeError("找不到 pkexec，无法显示系统授权窗口。请安装系统的 policykit-1 软件包。")
-        command.insert(0, pkexec)
-    return command
+    return {
+        "operation": "camera",
+        "mappings": [f"{node}={alias}" for node, alias in mappings],
+        "expected": [f"{node}={core.identity_token(by_node[node])}" for node in sorted({n for n, _ in mappings})],
+    }
 
 
-class CameraPanel:
+class DevicePanel:
+    """Shared GTK job, authorization, error, and window-lifecycle behavior."""
+
+    def __init__(self, gtk, gdk, glib, window, session=None):
+        self.gtk, self.gdk, self.glib, self.window = gtk, gdk, glib, window
+        self.session = session if session is not None else PrivilegedSession()
+        self.loaded = self.busy = self.saving = self.closed = False
+        self.previews: dict[str, subprocess.Popen] = {}
+
+    def label(self, text: str, style: str):
+        """Create a left-aligned, styled label without markup interpolation."""
+        label = self.gtk.Label(label=text)
+        label.set_xalign(0)
+        label.get_style_context().add_class(style)
+        return label
+
+    def add_check_section(self, outer) -> None:
+        """Keep a visible, selectable report separate from save-progress messages."""
+        gtk = self.gtk
+        frame = gtk.Frame(label="绑定检查 · 仅读取，无需密码")
+        box = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=6)
+        box.set_border_width(10)
+        self.check_summary = self.label("尚未检查", "muted")
+        box.pack_start(self.check_summary, False, False, 0)
+        self.check_details = self.label("点击“检查绑定”可重新读取当前设备状态。", "status")
+        self.check_details.set_line_wrap(True)
+        self.check_details.set_selectable(True)
+        scroll = gtk.ScrolledWindow()
+        scroll.set_policy(gtk.PolicyType.NEVER, gtk.PolicyType.AUTOMATIC)
+        scroll.set_min_content_height(65)
+        scroll.set_max_content_height(130)
+        scroll.set_propagate_natural_height(True)
+        scroll.add(self.check_details)
+        box.pack_start(scroll, True, True, 0)
+        frame.add(box)
+        outer.pack_start(frame, False, False, 0)
+
+    def check_message(self, summary: str, detail: str, style: str = "muted") -> None:
+        """Replace any previous pass state, including after edits or read errors."""
+        self.check_summary.set_text(summary)
+        context = self.check_summary.get_style_context()
+        for name in ("muted", "check-ok", "check-issue"):
+            context.remove_class(name)
+        context.add_class(style)
+        self.check_details.set_text(detail)
+
+    def configuration_changed(self, *_args) -> None:
+        """Invalidate results when they no longer describe the visible selection."""
+        self.update_validation()
+        if hasattr(self, "check_summary"):
+            self.check_message("配置已更改，请重新检查", "点击“检查绑定”，确认当前选择是否已在系统中生效。")
+
+    def show_checks(self, results: list[checks.BindingCheck]) -> None:
+        """Summarize only checked items; skipped roles never count as a pass."""
+        selected = [item for item in results if item.ok is not None]
+        passed = sum(item.ok for item in selected)
+        if not selected:
+            summary, style = "尚未选择要检查的设备", "muted"
+        elif passed == len(selected):
+            summary, style = f"全部已绑定 · {passed}/{len(selected)} 项通过", "check-ok"
+        else:
+            summary, style = f"存在未就绪项 · {passed}/{len(selected)} 项通过", "check-issue"
+        summary += f" · 检查时间 {datetime.now().astimezone():%H:%M:%S}"
+        lines = []
+        for item in results:
+            state = "未检查" if item.ok is None else "通过" if item.ok else "未就绪"
+            lines.append(f"[{state}] {item.name}：{item.detail}")
+        self.check_message(summary, "\n".join(lines), style)
+
+    def run_check(self, work) -> None:
+        """Run live inspection without starting the privileged helper."""
+        self.check_message("正在检查…", "正在读取当前设备和绑定状态。")
+
+        def complete(result, error):
+            if error:
+                self.check_message("检查失败", error, "check-issue")
+            else:
+                self.show_checks(result)
+
+        self.background(work, complete)
+
+    def background(self, work, complete) -> None:
+        """Perform hardware queries and privileged work without blocking the GTK loop."""
+        self.set_busy(True)
+
+        def worker():
+            try:
+                result, error = work(), None
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+                result, error = None, str(exc)
+            self.glib.idle_add(finish, result, error)
+
+        def finish(result, error):
+            if not self.closed:
+                self.set_busy(False)
+                complete(result, error)
+            return False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def show_error(self, message: str) -> bool:
+        """Show actionable failures while leaving the current choices intact."""
+        if self.closed:
+            return False
+        dialog = self.gtk.MessageDialog(
+            transient_for=self.window, modal=True, message_type=self.gtk.MessageType.ERROR,
+            buttons=self.gtk.ButtonsType.CLOSE, text="操作未完成",
+        )
+        dialog.format_secondary_text(message)
+        dialog.run()
+        dialog.destroy()
+        return False
+
+    def on_close(self, *_args) -> bool:
+        """Keep the installer visible until it finishes, and close this panel's previews."""
+        if self.saving:
+            self.status.set_text("绑定正在保存，请等待系统授权或保存结果后再关闭。")
+            return True
+        self.closed = True
+        for process in self.previews.values():
+            if process.poll() is None:
+                process.terminate()
+        self.session.close()
+        return False
+
+
+class CameraPanel(DevicePanel):
     """A responsive desktop window with one RGB selector per editable alias."""
 
-    def __init__(self, gtk, gdk, glib, window=None):
-        self.gtk, self.gdk, self.glib = gtk, gdk, glib
+    def __init__(self, gtk, gdk, glib, window=None, session=None):
+        owns_window = window is None
+        window = window if window is not None else gtk.Window(title="RGB 相机绑定")
+        super().__init__(gtk, gdk, glib, window, session)
         self.cameras: list[core.Camera] = []
         self.rgb: list[core.Camera] = []
         self.rows: list[dict] = []
-        self.loaded = False
-        self.busy = False
-        self.saving = False
-        self.closed = False
-        self.previews: dict[str, subprocess.Popen] = {}
-        owns_window = window is None
-        self.window = window if window is not None else gtk.Window(title="RGB 相机绑定")
         if owns_window:
-            self.window.set_default_size(940, 720)
+            self.window.set_default_size(980, 870)
             self.window.set_position(gtk.WindowPosition.CENTER)
             self.window.connect("delete-event", self.on_close)
             self.window.connect("destroy", lambda *_: gtk.main_quit() if gtk.main_level() else None)
@@ -86,6 +204,8 @@ class CameraPanel:
             .row-title { font-weight: bold; color: #243752; }
             .primary { background: #2563eb; color: white; font-weight: bold; border-radius: 6px; }
             .status { color: #334760; }
+            .check-ok { color: #14733c; font-weight: bold; }
+            .check-issue { color: #b54708; font-weight: bold; }
             entry, combobox button { min-height: 30px; }
             button { padding: 7px 12px; }
         """)
@@ -105,6 +225,9 @@ class CameraPanel:
         self.refresh_button = gtk.Button(label="刷新相机")
         self.refresh_button.connect("clicked", lambda *_: self.refresh())
         toolbar.pack_start(self.refresh_button, False, False, 0)
+        self.check_button = gtk.Button(label="检查绑定")
+        self.check_button.connect("clicked", self.check_bindings)
+        toolbar.pack_start(self.check_button, False, False, 0)
         self.add_button = gtk.Button(label="＋ 添加别名")
         self.add_button.connect("clicked", self.add_clicked)
         toolbar.pack_start(self.add_button, False, False, 0)
@@ -122,8 +245,10 @@ class CameraPanel:
         self.status.set_line_wrap(True)
         self.status.set_selectable(True)
         outer.pack_start(self.status, False, False, 0)
+        self.add_check_section(outer)
         footer = gtk.Box(spacing=16)
-        note = self.label("保存时可能需要输入系统管理员密码。", "muted")
+        note = self.label("首次保存时授权；本窗口内相机与 CAN 共用授权，关闭后结束。", "muted")
+        note.set_line_wrap(True)
         footer.pack_start(note, True, True, 0)
         self.save_button = gtk.Button(label="保存绑定")
         self.save_button.get_style_context().add_class("primary")
@@ -134,13 +259,6 @@ class CameraPanel:
         if owns_window:
             self.window.show_all()
         self.refresh()
-
-    def label(self, text: str, style: str):
-        """Create a left-aligned, styled label without markup interpolation."""
-        label = self.gtk.Label(label=text)
-        label.set_xalign(0)
-        label.get_style_context().add_class(style)
-        return label
 
     def add_row(self, node: str | None, alias: str) -> None:
         """Add an editable role and a read-only combo containing RGB nodes only."""
@@ -183,12 +301,12 @@ class CameraPanel:
         row = {"card": card, "entry": entry, "combo": combo, "detail": detail, "preview": preview}
         self.rows.append(row)
         self.rows_box.pack_start(card, False, False, 0)
-        entry.connect("changed", lambda *_: self.update_validation())
-        combo.connect("changed", lambda *_: self.update_validation())
+        entry.connect("changed", self.configuration_changed)
+        combo.connect("changed", self.configuration_changed)
         remove.connect("clicked", lambda *_: self.remove_row(row))
         preview.connect("clicked", lambda *_: self.preview(row))
         card.show_all()
-        self.update_validation()
+        self.configuration_changed()
 
     def add_clicked(self, *_args) -> None:
         """Offer a free alias name for another camera position."""
@@ -202,7 +320,7 @@ class CameraPanel:
         """Remove an alias from the next saved configuration."""
         self.rows.remove(row)
         row["card"].destroy()
-        self.update_validation()
+        self.configuration_changed()
 
     def selections(self) -> list[tuple[str, str]]:
         """Validate all rows before allowing a save."""
@@ -240,28 +358,26 @@ class CameraPanel:
         """Disable edits while scanning or saving so a submitted selection stays intact."""
         self.busy = value
         self.refresh_button.set_sensitive(not value)
+        self.check_button.set_sensitive(not value)
         self.add_button.set_sensitive(not value)
         self.rows_box.set_sensitive(not value)
         self.update_validation()
 
-    def background(self, work, complete) -> None:
-        """Perform hardware queries and privileged work without blocking the GTK loop."""
-        self.set_busy(True)
+    def check_mappings(self) -> list[tuple[str | None, str]]:
+        """Include incomplete rows so offline or unselected cameras remain visible."""
+        return [(row["combo"].get_active_id() or None, row["entry"].get_text().strip()) for row in self.rows]
 
-        def worker():
-            try:
-                result, error = work(), None
-            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
-                result, error = None, str(exc)
-            self.glib.idle_add(finish, result, error)
+    def check_bindings(self, *_args) -> None:
+        """Inspect aliases against a fresh camera inventory without saving anything."""
+        snapshot, mappings = list(self.cameras), self.check_mappings()
+        self.run_check(lambda: checks.check_cameras(snapshot, mappings, core.discover_cameras()))
 
-        def finish(result, error):
-            if not self.closed:
-                self.set_busy(False)
-                complete(result, error)
-            return False
-
-        threading.Thread(target=worker, daemon=True).start()
+    def show_current_checks(self) -> None:
+        """Inspect the inventory just read by refresh without another hardware scan."""
+        try:
+            self.show_checks(checks.check_cameras(self.cameras, self.check_mappings(), self.cameras))
+        except (OSError, ValueError, RuntimeError) as exc:
+            self.check_message("检查失败", str(exc), "check-issue")
 
     def refresh(self) -> None:
         """Rescan RGB sensors; preserve choices only if the selected identity is unchanged."""
@@ -284,6 +400,7 @@ class CameraPanel:
                     row["combo"].remove_all()
                 self.count.set_text("读取失败")
                 self.status.set_text(error)
+                self.check_message("检查失败", error, "check-issue")
                 self.update_validation()
                 return
             cameras, rgb, unavailable, bindings = result
@@ -308,6 +425,7 @@ class CameraPanel:
                 message += "\n" + "\n".join(unavailable)
             self.status.set_text(message)
             self.update_validation()
+            self.show_current_checks()
 
         self.background(scan, complete)
 
@@ -317,7 +435,7 @@ class CameraPanel:
             mappings = self.selections()
             core.make_rules(self.cameras, mappings, "auto")
             core.check_conflicts(mappings)
-            command = install_command(self.cameras, mappings)
+            request = camera_request(self.cameras, mappings)
         except (OSError, ValueError, RuntimeError) as exc:
             self.show_error(str(exc))
             return
@@ -325,24 +443,23 @@ class CameraPanel:
         self.status.set_text("正在保存绑定，请完成系统授权并稍候…")
 
         def install():
-            result = subprocess.run(command, capture_output=True, text=True, timeout=180)
-            if result.returncode != 0:
-                detail = (result.stderr + "\n" + result.stdout).strip()
-                if result.returncode == 126:
-                    detail = "已取消系统授权，绑定未更新。"
-                raise RuntimeError(detail or "保存失败，请确认系统授权服务可用。")
-            return result.stdout
+            output = self.session.execute(request)
+            results = checks.check_cameras(self.cameras, mappings, core.discover_cameras())
+            return output, results
 
-        def complete(output, error):
+        def complete(result, error):
             self.saving = False
             if error:
                 self.status.set_text("保存未完成。")
+                self.check_message("保存未完成，请重新检查", error, "check-issue")
                 self.show_error(error)
             else:
+                output, results = result
                 details = "；".join(f"/dev/{alias} → /dev/{node}" for node, alias in mappings)
                 self.status.set_text(f"绑定已保存并验证：{details}")
                 if "连接位置" in output:
                     self.status.set_text(self.status.get_text() + "\n部分相机按连接位置绑定，请保持 USB 插口不变。")
+                self.show_checks(results)
 
         self.background(install, complete)
 
@@ -374,74 +491,37 @@ class CameraPanel:
 
         threading.Thread(target=watch, daemon=True).start()
 
-    def show_error(self, message: str) -> bool:
-        """Show actionable failures while leaving the current choices intact."""
-        if self.closed:
-            return False
-        dialog = self.gtk.MessageDialog(
-            transient_for=self.window, modal=True, message_type=self.gtk.MessageType.ERROR,
-            buttons=self.gtk.ButtonsType.CLOSE, text="操作未完成",
-        )
-        dialog.format_secondary_text(message)
-        dialog.run()
-        dialog.destroy()
-        return False
 
-    def on_close(self, *_args) -> bool:
-        """Keep the installer visible until it finishes, and close this panel's previews."""
-        if self.saving:
-            self.status.set_text("绑定正在保存，请等待系统授权或保存结果后再关闭。")
-            return True
-        self.closed = True
-        for process in self.previews.values():
-            if process.poll() is None:
-                process.terminate()
-        return False
-
-
-def can_install_command(ports: list[can.CanPort], master: str, follower: str, bitrate: int) -> list[str]:
-    """Authenticate once for both arm roles and preserve their selected USB identities."""
+def can_request(ports: list[can.CanPort], master: str | None, follower: str | None, bitrate: int) -> dict:
+    """Preserve only the selected roles and their USB identity snapshots."""
     bindings = can.validate_bindings(ports, master, follower, bitrate)
-    command = [
-        "/usr/bin/python3", str(Path(can.__file__).resolve()),
-        "--master", master, "--follower", follower, "--bitrate", str(bitrate),
-    ]
-    for port, _ in bindings:
-        command.extend(["--expect-port", f"{port.usb}={can.identity_token(port)}"])
-    if os.geteuid() != 0:
-        pkexec = shutil.which("pkexec")
-        if pkexec is None:
-            raise RuntimeError("找不到 pkexec，无法显示系统授权窗口。")
-        command.insert(0, pkexec)
-    return command
+    return {
+        "operation": "can", "master": master, "follower": follower, "bitrate": bitrate,
+        "expected": [f"{port.usb}={can.identity_token(port)}" for port, _ in bindings],
+    }
 
 
-class CanPanel:
+class CanPanel(DevicePanel):
     """Select the USB adapters assigned to can_master and can_follower."""
 
-    # The two pages share GTK labels, asynchronous job handling, and error presentation.
-    label = CameraPanel.label
-    background = CameraPanel.background
-    show_error = CameraPanel.show_error
-    on_close = CameraPanel.on_close
-
-    def __init__(self, gtk, gdk, glib, window):
-        self.gtk, self.gdk, self.glib, self.window = gtk, gdk, glib, window
-        self.busy = self.saving = self.closed = self.loaded = False
-        self.previews = {}
+    def __init__(self, gtk, gdk, glib, window, session=None):
+        super().__init__(gtk, gdk, glib, window, session)
         self.ports: list[can.CanPort] = []
         self.rows = []
         outer = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=16)
         outer.set_border_width(28)
         self.widget = outer
         outer.pack_start(self.label("机械臂 CAN 绑定", "title"), False, False, 0)
-        outer.pack_start(self.label("为主臂和从臂选择 USB CAN 端口，并设置通信波特率。", "muted"), False, False, 0)
+        outer.pack_start(self.label("可只配置主臂、只配置从臂，或同时配置；不需要的角色选择“本次不配置”。", "muted"), False, False, 0)
         toolbar = gtk.Box(spacing=12)
         self.count = self.label("正在查找 USB CAN 端口…", "count")
         toolbar.pack_start(self.count, True, True, 0)
         self.refresh_button = gtk.Button(label="刷新端口")
         self.refresh_button.connect("clicked", lambda *_: self.refresh())
         toolbar.pack_start(self.refresh_button, False, False, 0)
+        self.check_button = gtk.Button(label="检查绑定")
+        self.check_button.connect("clicked", self.check_bindings)
+        toolbar.pack_start(self.check_button, False, False, 0)
         outer.pack_start(toolbar, False, False, 0)
         self.fields = gtk.Box(orientation=gtk.Orientation.VERTICAL, spacing=14)
         for role, title in (("can_master", "主臂"), ("can_follower", "从臂")):
@@ -454,7 +534,7 @@ class CanPanel:
             card.pack_start(detail, False, False, 0)
             self.rows.append({"role": role, "combo": combo, "detail": detail})
             self.fields.pack_start(card, False, False, 0)
-            combo.connect("changed", lambda *_: self.update_validation())
+            combo.connect("changed", self.configuration_changed)
         bitrate_line = gtk.Box(spacing=14)
         bitrate_line.pack_start(self.label("CAN 波特率（bit/s）", "row-title"), False, False, 0)
         self.bitrate = gtk.ComboBoxText.new_with_entry()
@@ -470,28 +550,33 @@ class CanPanel:
         self.status.set_line_wrap(True)
         self.status.set_selectable(True)
         outer.pack_start(self.status, True, True, 0)
+        self.add_check_section(outer)
         footer = gtk.Box(spacing=12)
         note = self.label("CAN 端口激活在重启或重新插拔后需要再次执行。", "muted")
         note.set_line_wrap(True)
         footer.pack_start(note, True, True, 0)
-        self.save_button = gtk.Button(label="绑定并激活主从臂")
+        self.save_button = gtk.Button(label="绑定并激活所选机械臂")
         self.save_button.get_style_context().add_class("primary")
         self.save_button.connect("clicked", self.save)
         footer.pack_start(self.save_button, False, False, 0)
         outer.pack_start(footer, False, False, 0)
-        self.bitrate.get_child().connect("changed", lambda *_: self.update_validation())
+        self.bitrate.get_child().connect("changed", self.configuration_changed)
         self.widget.show_all()
         self.refresh()
 
-    def selections(self) -> tuple[str, str, int]:
-        """Require two distinct connected CAN adapters and a valid bitrate."""
+    def check_parameters(self) -> tuple[str | None, str | None, int]:
+        """Snapshot GTK fields on the main thread, allowing explicitly skipped roles."""
         master, follower = (row["combo"].get_active_id() for row in self.rows)
-        if not master or not follower:
-            raise ValueError("请分别为主臂和从臂选择 USB CAN 端口。")
+        master, follower = master or None, follower or None
         try:
             bitrate = int(self.bitrate.get_child().get_text().strip())
         except ValueError as exc:
             raise ValueError("波特率必须为整数，例如 1000000。") from exc
+        return master, follower, bitrate
+
+    def selections(self) -> tuple[str | None, str | None, int]:
+        """Require at least one role, distinct adapters, and a valid bitrate."""
+        master, follower, bitrate = self.check_parameters()
         can.validate_bindings(self.ports, master, follower, bitrate)
         return master, follower, bitrate
 
@@ -502,7 +587,7 @@ class CanPanel:
         by_usb = {port.usb: port for port in self.ports}
         for row in self.rows:
             port = by_usb.get(row["combo"].get_active_id())
-            text = "请选择端口"
+            text = "本次不配置此机械臂"
             if port:
                 text = f"当前名称：{port.name}   ·   {'已启用' if port.up else '未启用'}   ·   波特率：{port.bitrate or '未设置/未读取'}"
             row["detail"].set_text(text)
@@ -520,7 +605,30 @@ class CanPanel:
         self.busy = value
         self.fields.set_sensitive(not value)
         self.refresh_button.set_sensitive(not value)
+        self.check_button.set_sensitive(not value)
         self.update_validation()
+
+    def current_checks(self, ports: list[can.CanPort]) -> list[checks.BindingCheck]:
+        """Describe the visible roles, including explicitly skipped ones."""
+        master, follower, bitrate = self.check_parameters()
+        return checks.check_can(self.ports, master, follower, bitrate, ports)
+
+    def check_bindings(self, *_args) -> None:
+        """Read current kernel state; checking never activates a port or requests a password."""
+        try:
+            master, follower, bitrate = self.check_parameters()
+        except ValueError as exc:
+            self.check_message("检查失败", str(exc), "check-issue")
+            return
+        snapshot = list(self.ports)
+        self.run_check(lambda: checks.check_can(snapshot, master, follower, bitrate, can.discover_ports(strict=True)))
+
+    def show_current_checks(self) -> None:
+        """Reuse a just-read inventory after refresh or activation."""
+        try:
+            self.show_checks(self.current_checks(self.ports))
+        except (OSError, ValueError, RuntimeError) as exc:
+            self.check_message("检查失败", str(exc), "check-issue")
 
     def refresh(self) -> None:
         """Read USB CAN ports, retaining explicit selections when adapters are unchanged."""
@@ -534,9 +642,9 @@ class CanPanel:
                 self.status.set_text(error)
             else:
                 self.ports = ports
-                self.status.set_text("选择端口后点击“绑定并激活主从臂”，随后完成系统授权。")
+                self.status.set_text("选择需要配置的端口后点击“绑定并激活所选机械臂”；本窗口仅首次执行需要授权。")
             by_usb = {port.usb: port for port in self.ports}
-            defaults = (can.DEFAULT_MASTER, can.DEFAULT_FOLLOWER)
+            defaults = checks.default_can_selections(self.ports)
             for index, row in enumerate(self.rows):
                 combo = row["combo"]
                 selected = previous[index] if self.loaded else defaults[index]
@@ -545,7 +653,7 @@ class CanPanel:
                     if before is None or after is None or can.identity_token(before) != can.identity_token(after):
                         selected = None
                 combo.remove_all()
-                combo.append("", "请选择 USB CAN 端口")
+                combo.append("", "本次不配置")
                 for port in self.ports:
                     combo.append(port.usb, f"{port.usb}   ·   {port.name}   ·   {port.serial or '无序列号'}")
                 combo.set_active_id(selected if selected in by_usb else "")
@@ -554,14 +662,18 @@ class CanPanel:
             if not self.ports and not error:
                 self.status.set_text("未发现 USB CAN 适配器，请检查连接后刷新。")
             self.update_validation()
+            if error:
+                self.check_message("检查失败", error, "check-issue")
+            else:
+                self.show_current_checks()
 
         self.background(can.discover_ports, complete)
 
     def save(self, *_args) -> None:
-        """Run the existing activation script through the checked privileged helper."""
+        """Activate the selected roles through the shared privileged helper."""
         try:
             master, follower, bitrate = self.selections()
-            command = can_install_command(self.ports, master, follower, bitrate)
+            request = can_request(self.ports, master, follower, bitrate)
         except (OSError, ValueError, RuntimeError) as exc:
             self.show_error(str(exc))
             return
@@ -569,18 +681,13 @@ class CanPanel:
         self.status.set_text("正在绑定并激活 CAN 接口，请完成系统授权…")
 
         def activate():
-            result = subprocess.run(command, capture_output=True, text=True, timeout=300)
-            if result.returncode != 0:
-                detail = (result.stderr + "\n" + result.stdout).strip()
-                if result.returncode == 126:
-                    detail = "已取消系统授权，CAN 端口未修改。"
-                raise RuntimeError(detail or "CAN 绑定失败。")
-            return result.stdout, can.discover_ports()
+            return self.session.execute(request), can.discover_ports()
 
         def complete(result, error):
             self.saving = False
             if error:
                 self.status.set_text("CAN 绑定未完成，请查看错误信息后刷新端口状态。")
+                self.check_message("绑定未完成，请重新检查", error, "check-issue")
                 self.show_error(error)
             else:
                 output, self.ports = result
@@ -589,11 +696,12 @@ class CanPanel:
                 for row in self.rows:
                     selected = row["combo"].get_active_id()
                     row["combo"].remove_all()
-                    row["combo"].append("", "请选择 USB CAN 端口")
+                    row["combo"].append("", "本次不配置")
                     for port in self.ports:
                         row["combo"].append(port.usb, f"{port.usb}   ·   {port.name}   ·   {port.serial or '无序列号'}")
                     row["combo"].set_active_id(selected)
                 self.update_validation()
+                self.show_current_checks()
 
         self.background(activate, complete)
 
@@ -601,12 +709,13 @@ class CanPanel:
 def create_device_window(gtk, gdk, glib):
     """Put camera and arm configuration in separate tabs of one native window."""
     window = gtk.Window(title="Piper 设备绑定 · 相机与机械臂")
-    window.set_default_size(980, 770)
+    window.set_default_size(1000, 880)
     window.set_position(gtk.WindowPosition.CENTER)
     notebook = gtk.Notebook()
     window.add(notebook)
-    cameras = CameraPanel(gtk, gdk, glib, window=window)
-    arms = CanPanel(gtk, gdk, glib, window)
+    session = PrivilegedSession()
+    cameras = CameraPanel(gtk, gdk, glib, window=window, session=session)
+    arms = CanPanel(gtk, gdk, glib, window, session=session)
     notebook.append_page(cameras.widget, gtk.Label(label="RGB 相机"))
     notebook.append_page(arms.widget, gtk.Label(label="机械臂 CAN"))
 

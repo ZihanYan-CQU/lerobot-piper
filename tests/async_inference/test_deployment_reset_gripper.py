@@ -123,7 +123,7 @@ def test_reset_holds_object_until_arm_arrives_then_opens(make_reset_client, pose
     assert client.start_rollout()
 
 
-def test_reset_reseeds_real_piper_smoothing_before_first_command(make_reset_client, monkeypatch):
+def test_reset_uses_real_piper_planned_commands_and_reseeds_stream_state(make_reset_client, monkeypatch):
     client, robot = make_reset_client()
     client.config.reset_verify_timeout_s = 1.0
     send_to_motors = robot.send_action
@@ -132,10 +132,14 @@ def test_reset_reseeds_real_piper_smoothing_before_first_command(make_reset_clie
     # The last commanded gripper target is fully closed, but feedback is 16.7 mm.
     robot._ema_cmd = [0.0] * 7
     robot.bus = SimpleNamespace(
-        write=lambda values: send_to_motors(dict(zip(robot.action_features, values, strict=True)))
+        write=lambda values: send_to_motors(dict(zip(robot.action_features, values, strict=True))),
+        write_js=lambda values: pytest.fail("Piper reset must not use JS"),
     )
     monkeypatch.setattr(robot, "seed_command", partial(PIPERFollower.seed_command, robot), raising=False)
     monkeypatch.setattr(robot, "send_action", partial(PIPERFollower.send_action, robot))
+    monkeypatch.setattr(
+        robot, "send_action_planned", partial(PIPERFollower.send_action_planned, robot), raising=False
+    )
 
     assert client.reset_rollout()
     assert robot.commands[0][1]["gripper.pos"] == pytest.approx(0.0167)
@@ -143,6 +147,23 @@ def test_reset_reseeds_real_piper_smoothing_before_first_command(make_reset_clie
     for before, command, _ in robot.commands:
         if command["gripper.pos"] > 0.0167:
             assert abs(before["joint_1.pos"]) <= client.config.reset_joint_tolerance
+    assert not robot.holding_object
+
+
+def test_all_reset_phases_prefer_planned_entrypoint(make_reset_client, monkeypatch):
+    client, robot = make_reset_client()
+    send = robot.send_action
+    planned = []
+
+    def send_planned(action):
+        planned.append(dict(action))
+        return send(action)
+
+    monkeypatch.setattr(robot, "send_action_planned", send_planned, raising=False)
+    monkeypatch.setattr(robot, "send_action", lambda action: pytest.fail("Reset used streaming entrypoint"))
+    assert client.reset_rollout()
+    assert planned[0]["gripper.pos"] == pytest.approx(0.0167)
+    assert planned[-1]["gripper.pos"] == pytest.approx(0.07)
     assert not robot.holding_object
 
 

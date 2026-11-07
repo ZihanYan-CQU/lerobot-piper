@@ -125,14 +125,6 @@ def extract_state_from_raw_observation(
     return state
 
 
-def extract_images_from_raw_observation(
-    lerobot_obs: RawObservation,
-    camera_key: str,
-) -> dict[str, torch.Tensor]:
-    """Extract the images from a raw observation."""
-    return torch.tensor(lerobot_obs[camera_key])
-
-
 def make_lerobot_observation(
     robot_obs: RawObservation,
     lerobot_features: dict[str, dict],

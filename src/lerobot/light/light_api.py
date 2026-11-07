@@ -1,8 +1,9 @@
+"""Orvyn LED application commands over the shared runtime transport."""
+
 import time
-import sys
-import os
-sys.path.append(os.path.dirname(__file__))
-import orvyn_device
+
+from . import orvyn_device
+
 
 def signed_u8(value):
     return value - 256 if value >= 128 else value
@@ -274,13 +275,3 @@ class OrvynDevice:
             raise ValueError("Quota values must be 0-100")
         self.client.app_channel_write(self.CMD_QUOTA_SET, bytes([five_hour, week]))
         self._wait_response(self.CMD_QUOTA_SET)
-
-'''
-dev = OrvynDevice(timeout_ms=2000)
-dev.connect()
-#dev.set_led_color([(255, 0, 0), (255, 127, 0), (0, 255, 0)])
-#dev.set_led_config(base_brightness=0)
-dev.set_led_color([(255, 0, 0), (0, 0, 0), (0, 255, 0)])
-dev.set_sleep_config(enable=True, timeout_s=120, keep_5v=True)
-dev.close()
-'''

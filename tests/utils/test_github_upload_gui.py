@@ -18,12 +18,21 @@ import io
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from utils.github_upload_gui import GitRepo, UploadError, UploadSettings, credential_helper, normalize_remote
+from utils.github_upload_gui import (
+    GitRepo,
+    UploadError,
+    UploadSettings,
+    credential_helper,
+    format_size,
+    normalize_remote,
+    parse_git_progress,
+)
 
 
 @unittest.skipUnless(shutil.which("git"), "Git is required for repository integration tests")
@@ -540,6 +549,163 @@ class GitUploadTests(unittest.TestCase):
         self.assertEqual(self.remote_head(), advanced[0])
         self.assertEqual(self.git(self.remote, "show", "main:main.py").stdout, "initial\n")
         self.assertEqual((self.directory / "main.py").read_text(), "my update\n")
+
+    def test_preview_sizes_exclude_ignored_and_lfs_files_and_count_symlink_itself(self):
+        self.prepare(create_ignore=False)
+        self.write(".gitignore", ".venv/\n")
+        self.write(".gitattributes", "*.bin filter=lfs\n")
+        self.write("main.py", "中文\n")
+        self.write("empty.py", "")
+        self.write("weights.bin", "not included in code mode")
+        self.write(".venv/environment", "not included in any mode")
+        (self.directory / "link.py").symlink_to("main.py")
+
+        preview = self.repo.preview(code_only=True)
+
+        sizes = dict(preview.file_sizes)
+        self.assertEqual(sizes["main.py"], len("中文\n".encode()))
+        self.assertEqual(sizes["empty.py"], 0)
+        self.assertEqual(sizes["link.py"], len("main.py"))
+        self.assertNotIn("weights.bin", sizes)
+        self.assertNotIn(".venv/environment", sizes)
+        self.assertEqual(
+            preview.total_bytes, sum((self.directory / name).lstat().st_size for name in preview.files)
+        )
+
+    def test_legacy_sizes_follow_status_rows_for_renames_deleted_and_unusual_names(self):
+        self.prepare(create_ignore=False)
+        self.write("old.py", "rename this\n")
+        self.write("deleted.py", "delete this\n")
+        self.git(self.directory, "add", ".")
+        self.git(self.directory, "commit", "-m", "Baseline")
+        self.git(self.directory, "mv", "old.py", "renamed.py")
+        (self.directory / "deleted.py").unlink()
+        self.write("line\nbreak.py", "abc")
+
+        preview = self.repo.preview()
+
+        self.assertEqual(preview.file_sizes, (("deleted.py", 0), ("renamed.py", 12), ("line\nbreak.py", 3)))
+        self.assertEqual(len(preview.status.splitlines()), len(preview.file_sizes))
+        self.assertEqual(preview.total_bytes, 15)
+
+    def test_real_push_reports_preparation_bytes_and_live_git_stages_in_both_modes(self):
+        self.prepare()
+        self.write("source.py", "print('upload progress')\n" * 200)
+        for code_only in (True, False):
+            with self.subTest(code_only=code_only):
+                self.write("mode.py", f"code_only = {code_only}\n")
+                states = []
+                self.repo.progress = states.append
+                branch = "snapshot" if code_only else "history"
+                preview = self.repo.preview(code_only=code_only)
+                head = self.repo.upload(self.settings(code_only=code_only, branch=branch), expected=preview)
+                self.assertEqual(head, self.remote_head(branch))
+                sent = [state for state in states if state.phase == "发送代码"]
+                self.assertTrue(sent, states)
+                self.assertEqual(sent[-1].fraction, 1)
+                self.assertGreater(sent[-1].transferred_bytes, 0)
+                self.assertEqual(states[-1].phase, "等待远端确认")
+                if code_only:
+                    copied = [state for state in states if state.phase == "准备文件"]
+                    self.assertEqual(copied[-1].transferred_bytes, preview.total_bytes)
+                    self.assertEqual(copied[-1].total_bytes, preview.total_bytes)
+
+    def test_carriage_return_progress_is_delivered_before_child_exits_and_pipes_are_drained(self):
+        marker = self.root / "continue"
+        completed = self.root / "finished"
+        states = []
+
+        def on_progress(state):
+            self.assertFalse(completed.exists())
+            states.append(state)
+            marker.touch()
+
+        self.repo.progress = on_progress
+        script = (
+            "import sys,time\nfrom pathlib import Path\n"
+            "sys.stdout.write('x'*200000);sys.stdout.flush()\n"
+            "sys.stderr.write('Writing objects: 25% (1/4), 1.50 MiB | 256.00 KiB/s\\r');sys.stderr.flush()\n"
+            "deadline=time.monotonic()+3\n"
+            f"while not Path({str(marker)!r}).exists():\n"
+            "    assert time.monotonic()<deadline,'progress was buffered until process exit'\n"
+            "    time.sleep(.01)\n"
+            f"Path({str(completed)!r}).touch()\n"
+        )
+        result = self.repo._run_streaming([sys.executable, "-c", script], dict(os.environ), 5)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(result.stdout), 200000)
+        self.assertEqual(states[0].fraction, 0.25)
+        self.assertEqual(states[0].transferred_bytes, 1572864)
+        self.assertTrue(completed.exists())
+
+    def test_streaming_timeout_stops_the_child(self):
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.repo._run_streaming(
+                [sys.executable, "-c", "import time; time.sleep(30)"], dict(os.environ), 0.15
+            )
+
+    def test_streaming_failure_redacts_token_and_never_reports_overall_success(self):
+        fake = self.root / "fake-git"
+        token = "test-credential-never-real"
+        fake.write_text(
+            f"#!{sys.executable}\nimport sys\n"
+            "sys.stderr.write('Writing objects: 100% (4/4), 2.00 KiB | 1.00 KiB/s\\r')\n"
+            f"sys.stderr.write('remote: denied {token}\\n')\n"
+            "sys.exit(1)\n"
+        )
+        fake.chmod(0o755)
+        states = []
+        self.repo.progress = states.append
+        self.repo.git = str(fake)
+
+        with self.assertRaises(UploadError) as raised:
+            self.repo.run("push", stream_progress=True, token=token)
+
+        self.assertNotIn(token, str(raised.exception))
+        self.assertIn("[已隐藏 Token]", str(raised.exception))
+        self.assertEqual(states[-1].phase, "等待远端确认")
+        self.assertIsNone(states[-1].fraction)
+
+    def test_configured_username_reaches_ephemeral_credential_helper_without_persisting(self):
+        self.prepare()
+        token = "test-only-configured-credential"
+
+        result = self.repo.run(
+            "credential",
+            "fill",
+            network=True,
+            username="fixed-github-user",
+            token=token,
+            input_text="protocol=https\nhost=github.com\n\n",
+        )
+
+        self.assertIn("username=fixed-github-user", result.stdout)
+        self.assertIn("password=[已隐藏 Token]", result.stdout)
+        self.assertNotIn(token, self.repo.run("config", "--list").stdout)
+        self.assertFalse((self.home / ".git-credentials").exists())
+
+
+class ProgressParsingTests(unittest.TestCase):
+    def test_parse_git_stage_bytes_and_speed_in_binary_and_decimal_units(self):
+        binary = parse_git_progress("Writing objects: 42% (42/100), 2.50 MiB | 512.00 KiB/s")
+        self.assertEqual(binary.fraction, 0.42)
+        self.assertEqual(binary.transferred_bytes, 2621440)
+        self.assertEqual(binary.speed_bytes, 524288)
+        self.assertIsNone(binary.total_bytes)
+        decimal = parse_git_progress("Uploading LFS objects: 10% (1/10), 4.2 MB | 1.6 MB/s")
+        self.assertEqual(decimal.transferred_bytes, 4200000)
+        self.assertEqual(decimal.speed_bytes, 1600000)
+        counted = parse_git_progress("Counting objects: 100% (30/30), done.")
+        self.assertEqual(counted.fraction, 1)
+        self.assertIsNone(counted.transferred_bytes)
+        small = parse_git_progress("Writing objects: 100% (3/3), 279 bytes | 279.00 KiB/s, done.")
+        self.assertEqual(small.transferred_bytes, 279)
+        self.assertIsNone(parse_git_progress("fatal: connection failed"))
+
+    def test_file_sizes_use_explicit_binary_units(self):
+        for value, expected in ((0, "0 B"), (1023, "1023 B"), (1024, "1.0 KiB"), (3145728, "3.0 MiB")):
+            self.assertEqual(format_size(value), expected)
 
 
 class CredentialTests(unittest.TestCase):
